@@ -27,8 +27,8 @@ if [[ "${NOTARIZE:-0}" == "1" ]]; then
   done
 fi
 
-cargo build --release -p cc-same
-cargo build --release --manifest-path crates/app/Cargo.toml
+cargo build --release --locked -p cc-same
+cargo build --release --locked --manifest-path crates/app/Cargo.toml
 
 app="$out/CC Same.app"
 rm -rf "$app"

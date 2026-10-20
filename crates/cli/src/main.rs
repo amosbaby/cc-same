@@ -1,8 +1,12 @@
 //! `cc-same`: keep Claude Desktop's local sessions identical across all your accounts.
 
 use anyhow::{bail, Result};
-use cc_same_core::accounts::{self, NotFound, Roster, Slot, Strategy};
-use cc_same_core::desktop::{self, Quitting};
+use cc_same_core::accounts::{self, Roster};
+#[cfg(feature = "account-switching")]
+use cc_same_core::accounts::{NotFound, Slot, Strategy};
+use cc_same_core::desktop;
+#[cfg(feature = "account-switching")]
+use cc_same_core::desktop::Quitting;
 use cc_same_core::logins;
 use cc_same_core::report::{self, Overview, Warning};
 use cc_same_core::retention::{self, Kept, Limit};
@@ -103,6 +107,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    #[cfg(feature = "account-switching")]
     /// Switch Claude to another account, or the next one (Claude restarts if it is open)
     Switch {
         /// Its number, alias or email (default: the next account in the list)
@@ -113,9 +118,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    #[cfg(feature = "account-switching")]
     /// Restart Claude signed out, to add an account; the current one is kept
     #[command(alias = "sign-in")]
     Add,
+    #[cfg(feature = "account-switching")]
     /// Take an account off the list and forget the sign-in kept for it (its sessions stay)
     #[command(alias = "forget")]
     Remove {
@@ -124,6 +131,7 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    #[cfg(feature = "account-switching")]
     /// Give an account a short name, or list them
     Alias {
         /// Its number, alias or email
@@ -134,20 +142,35 @@ enum Cmd {
         #[arg(long, requires = "account", conflicts_with = "name")]
         unset: bool,
     },
+    #[cfg(feature = "account-switching")]
     /// Leave an account out of `switch` without an account (it can still be named)
     Disable { account: String },
+    #[cfg(feature = "account-switching")]
     /// Put an account back in the rotation
     Enable { account: String },
+    #[cfg(feature = "account-switching")]
     /// Give an account another number (the account that has it takes the old one)
     Move { account: String, number: u32 },
+    /// Every account/org folder on this computer, with full ids
+    Orgs {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or change settings
     Config {
-        /// Keep an account (or `<account>/<org>`) separate
+        /// Keep an account (or `<account>/<org>`) separate. A unique prefix is expanded to the full id
         #[arg(long, value_name = "ID")]
         exclude: Vec<String>,
         /// Undo an --exclude
         #[arg(long, value_name = "ID")]
         include: Vec<String>,
+        /// Sync only these accounts (or `<account>/<org>`); everything else stays separate,
+        /// including accounts that appear later. A unique prefix is expanded to the full id
+        #[arg(long, value_name = "ID")]
+        only: Vec<String>,
+        /// Empty the --only list (every account not excluded takes part again)
+        #[arg(long)]
+        clear_only: bool,
         /// Let accounts that appear later join automatically
         #[arg(long)]
         auto_join: Option<OnOff>,
@@ -157,6 +180,7 @@ enum Cmd {
     },
 }
 
+#[cfg(feature = "account-switching")]
 #[derive(Clone, Copy, ValueEnum)]
 enum StrategyArg {
     Next,
@@ -164,6 +188,7 @@ enum StrategyArg {
     Best,
 }
 
+#[cfg(feature = "account-switching")]
 impl From<StrategyArg> for Strategy {
     fn from(s: StrategyArg) -> Strategy {
         match s {
@@ -247,22 +272,42 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Retention { days, keep, undo } => retention(&ctx, days, keep, undo),
         Cmd::Accounts { json } => accounts(&ctx, json),
+        #[cfg(feature = "account-switching")]
         Cmd::Switch { account, strategy, json } => switch(&ctx, account.as_deref(), strategy.map(Into::into), json),
+        #[cfg(feature = "account-switching")]
         Cmd::Add => add(&ctx),
+        #[cfg(feature = "account-switching")]
         Cmd::Remove { account, yes } => remove(&ctx, &account, yes),
+        #[cfg(feature = "account-switching")]
         Cmd::Alias { account, name, unset } => alias(&ctx, account.as_deref(), name.as_deref(), unset),
+        #[cfg(feature = "account-switching")]
         Cmd::Disable { account } => sit_out(&ctx, &account, true),
+        #[cfg(feature = "account-switching")]
         Cmd::Enable { account } => sit_out(&ctx, &account, false),
+        #[cfg(feature = "account-switching")]
         Cmd::Move { account, number } => move_account(&ctx, &account, number),
-        Cmd::Config { exclude, include, auto_join, notify } => {
+        Cmd::Orgs { json } => orgs(&ctx, json),
+        Cmd::Config { exclude, include, only, clear_only, auto_join, notify } => {
             let mut cfg = ctx.config();
             let before = cfg.clone();
+            let known = known_pairs(&ctx);
             for id in exclude {
+                let id = resolve(&id, &known)?;
                 if !cfg.exclude.contains(&id) {
                     cfg.exclude.push(id);
                 }
             }
+            let include: Vec<String> = include.iter().map(|i| i.trim().to_ascii_lowercase()).collect();
             cfg.exclude.retain(|e| !include.contains(e));
+            if clear_only {
+                cfg.only.clear();
+            }
+            for id in only {
+                let id = resolve(&id, &known)?;
+                if !cfg.only.contains(&id) {
+                    cfg.only.push(id);
+                }
+            }
             if let Some(v) = auto_join {
                 cfg.auto_join_new = matches!(v, OnOff::On);
             }
@@ -273,9 +318,79 @@ fn run(cli: Cli) -> Result<()> {
                 cfg.save(&ctx.paths)?;
             }
             println!("{}", serde_json::to_string_pretty(&cfg)?);
+            for w in cfg.invalid_entries() {
+                eprintln!("! `{w}` is not a full id and matches nothing; syncing stays stopped until it is removed");
+            }
             Ok(())
         }
     }
+}
+
+/// Every account/org pair this computer knows of: the session folders, and the pairs in
+/// Claude's log (an account that has no folder yet).
+fn known_pairs(ctx: &Ctx) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Surface::ALL
+        .iter()
+        .flat_map(|s| scan::discover(ctx, *s))
+        .map(|p| (p.acct, p.org))
+        .chain(desktop::detect(ctx).pairs)
+        .chain(desktop::last_init_pair(ctx))
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    pairs
+}
+
+fn resolve(input: &str, known: &[(String, String)]) -> Result<String> {
+    let id = cc_same_core::config::resolve_entry(input, known)?;
+    if id != input.trim().to_ascii_lowercase() {
+        eprintln!("{input} -> {id}");
+    } else if !known.iter().any(|(a, o)| id == *a || id == format!("{a}/{o}")) {
+        eprintln!("note: {id} is not on this computer yet; it applies once it appears");
+    }
+    Ok(id)
+}
+
+fn orgs(ctx: &Ctx, json: bool) -> Result<()> {
+    let cfg = ctx.config();
+    let labels = scan::account_labels(ctx);
+    let app = desktop::detect(ctx);
+    let mut rows = Vec::new();
+    for (acct, org) in known_pairs(ctx) {
+        let part = scan::discover(ctx, Surface::Code).into_iter().find(|p| p.acct == acct && p.org == org);
+        let sessions = part.as_ref().map(|p| scan::scan_partition(ctx, p).live_sessions());
+        let open =
+            app.open_account.as_deref() == Some(acct.as_str()) && app.open_org.as_deref().is_none_or(|o| o == org);
+        rows.push(serde_json::json!({
+            "id": format!("{acct}/{org}"),
+            "account": acct,
+            "org": org,
+            "email": labels.get(&acct),
+            "sessions": sessions,
+            "open": open && app.running,
+            "syncs": !cfg.is_excluded(&acct, &org),
+        }));
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("No Claude account folders found in {}", ctx.paths.user_data.display());
+    }
+    for r in &rows {
+        let sessions =
+            r["sessions"].as_u64().map(|n| format!("{n} sessions")).unwrap_or_else(|| "no folder yet".into());
+        println!(
+            "{}  {:<30} {:<14} {}{}",
+            r["id"].as_str().unwrap_or_default(),
+            r["email"].as_str().unwrap_or("-"),
+            sessions,
+            if r["syncs"] == true { "syncs" } else { "separate" },
+            if r["open"] == true { "  OPEN IN CLAUDE" } else { "" },
+        );
+    }
+    Ok(())
 }
 
 fn confirm(prompt: &str) -> bool {
@@ -429,6 +544,10 @@ fn warning_text(w: &Warning) -> String {
             format!("{missing} of {total} sessions no longer have a transcript on disk; they open empty or not at all")
         }
         Warning::DesktopDataMissing { path } => format!("Claude Desktop's data folder was not found at {}", path.display()),
+        Warning::InvalidConfigEntries { entries } => format!(
+            "Syncing is stopped: these config ids are not full ids and match nothing: {}. Remove them (cc-same config --include <id> / --clear-only) and add the full ids from `cc-same orgs`",
+            entries.join(", ")
+        ),
     }
 }
 
@@ -521,6 +640,7 @@ fn known_accounts(ctx: &Ctx, roster: &Roster) -> BTreeMap<String, String> {
     known
 }
 
+#[cfg(feature = "account-switching")]
 /// The account `query` names in the list; an account only seen in Claude's session folders is
 /// named in the error, with how to add it.
 fn named(ctx: &Ctx, roster: &Roster, query: &str) -> Result<(String, String)> {
@@ -545,6 +665,7 @@ fn named(ctx: &Ctx, roster: &Roster, query: &str) -> Result<(String, String)> {
     }
 }
 
+#[cfg(feature = "account-switching")]
 fn name_in(roster: &Roster, account: &str) -> String {
     roster.slot(account).map(Slot::label).unwrap_or_else(|| format!("Account {}", short(account)))
 }
@@ -636,6 +757,7 @@ fn accounts(ctx: &Ctx, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "account-switching")]
 fn switch(ctx: &Ctx, account: Option<&str>, strategy: Option<Strategy>, json: bool) -> Result<()> {
     let roster = accounts::observe(ctx);
     let found = logins::list(ctx);
@@ -675,6 +797,7 @@ fn switch(ctx: &Ctx, account: Option<&str>, strategy: Option<Strategy>, json: bo
     Ok(())
 }
 
+#[cfg(feature = "account-switching")]
 /// Claude asks before it quits when it has work in progress: say so, and what Ctrl-C does then.
 fn quit_watch() -> desktop::Watch<'static> {
     fn tell(quitting: Quitting) {
@@ -691,6 +814,7 @@ fn quit_watch() -> desktop::Watch<'static> {
     desktop::Watch { progress: Some(&tell), stop: None }
 }
 
+#[cfg(feature = "account-switching")]
 fn add(ctx: &Ctx) -> Result<()> {
     let switched = accounts::add(ctx, &quit_watch())?;
     let roster = Roster::load(&ctx.paths);
@@ -704,6 +828,7 @@ fn add(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "account-switching")]
 fn remove(ctx: &Ctx, query: &str, yes: bool) -> Result<()> {
     let roster = accounts::observe(ctx);
     let (id, name) = named(ctx, &roster, query)?;
@@ -716,6 +841,7 @@ fn remove(ctx: &Ctx, query: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "account-switching")]
 fn alias(ctx: &Ctx, account: Option<&str>, name: Option<&str>, unset: bool) -> Result<()> {
     let roster = accounts::observe(ctx);
     let Some(query) = account else {
@@ -745,6 +871,7 @@ fn alias(ctx: &Ctx, account: Option<&str>, name: Option<&str>, unset: bool) -> R
     Ok(())
 }
 
+#[cfg(feature = "account-switching")]
 fn sit_out(ctx: &Ctx, query: &str, disabled: bool) -> Result<()> {
     let roster = accounts::observe(ctx);
     let (id, name) = named(ctx, &roster, query)?;
@@ -757,6 +884,7 @@ fn sit_out(ctx: &Ctx, query: &str, disabled: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "account-switching")]
 fn move_account(ctx: &Ctx, query: &str, number: u32) -> Result<()> {
     let roster = accounts::observe(ctx);
     let (id, name) = named(ctx, &roster, query)?;

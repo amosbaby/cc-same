@@ -59,7 +59,7 @@ pub struct Heartbeat {
 
 impl Heartbeat {
     pub fn read(paths: &Paths) -> Option<Heartbeat> {
-        serde_json::from_slice(&fs::read(paths.heartbeat_file()).ok()?).ok()
+        serde_json::from_slice(&fsx::read_limited(&paths.heartbeat_file(), 64 * 1024).ok()?).ok()
     }
 
     /// The agent wrote its heartbeat within the last minute.
@@ -320,7 +320,9 @@ mod platform {
         }
         bootout(LABEL);
         fs::create_dir_all(path.parent().unwrap())?;
-        fs::write(&path, body)?;
+        fsx::atomic_write(&path, body.as_bytes(), None, false)?;
+        // launchd creates the agent's log with the default 0644; create it private first.
+        let _ = fsx::open_private_append(&ctx.paths.log_file.with_extension("agent.log"));
         // launchd may still be letting go of the old job for a moment.
         let mut error = String::new();
         for attempt in 1..=5 {
@@ -515,7 +517,7 @@ mod platform {
             );
             let path = unit_path();
             fs::create_dir_all(path.parent().unwrap())?;
-            fs::write(&path, unit)?;
+            fsx::atomic_write(&path, unit.as_bytes(), None, false)?;
             if systemctl(&["daemon-reload"]) && systemctl(&["enable", UNIT]) && systemctl(&["restart", UNIT]) {
                 let _ = fs::remove_file(autostart_path());
                 return Ok(());
@@ -525,9 +527,11 @@ mod platform {
         // No systemd user session: XDG autostart for the next login, and start it now.
         let path = autostart_path();
         fs::create_dir_all(path.parent().unwrap())?;
-        fs::write(
+        fsx::atomic_write(
             &path,
-            format!("[Desktop Entry]\nType=Application\nName={DISPLAY_NAME}\nExec={exec}\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"),
+            format!("[Desktop Entry]\nType=Application\nName={DISPLAY_NAME}\nExec={exec}\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n").as_bytes(),
+            None,
+            false,
         )?;
         Command::new(&program[0])
             .args(&program[1..])

@@ -270,6 +270,8 @@ pub fn apply_plan(ctx: &Ctx, mut plan: Plan, state: &mut State, reason: &str) ->
 
 /// Plan and apply until nothing is left (a few rounds at most), under the lock.
 pub fn run_sync(ctx: &Ctx, reason: &str) -> Result<(Plan, Outcome)> {
+    // A typo in `exclude` must not quietly sync an account that was meant to stay out.
+    ctx.config().check()?;
     let _lock = Lock::acquire(ctx, Duration::from_secs(30))?;
     clear_stale_restart_hint(ctx)?;
     let mut total = Outcome::default();

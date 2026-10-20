@@ -29,7 +29,7 @@ jobs:
       # Secrets cannot appear in `if:`; this tells the steps whether Apple signing is set up.
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -38,12 +38,14 @@ jobs:
             libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev pkg-config
       - name: Install the pinned toolchain
         run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          workspaces: |
-            . -> target
-            crates/app -> ../../target
+      # No build cache in release builds: a cache written by another workflow must not reach
+      # signed binaries. Build before the signing identity is imported, so no build script or
+      # proc macro runs while it is available.
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --locked -p cc-same
+          cargo build --release --locked --manifest-path crates/app/Cargo.toml
       # With the Apple secrets set, macOS builds are signed with a Developer ID, notarized and
       # stapled; without them (forks), they are ad-hoc signed.
       - name: Import the signing identity (macOS)
@@ -92,15 +94,15 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-          cargo build --release -p cc-same
-          cargo build --release --manifest-path crates/app/Cargo.toml
+          cargo build --release --locked -p cc-same
+          cargo build --release --locked --manifest-path crates/app/Cargo.toml
           New-Item -ItemType Directory -Force dist/app, dist/cli | Out-Null
           Copy-Item target/release/cc-same-app.exe "dist/app/CC Same.exe"
           Copy-Item target/release/cc-same.exe, target/release/cc-same-agent.exe dist/cli/
           Compress-Archive -Path "dist/app/*" -DestinationPath "dist/CC-Same-$version-windows-x64.zip"
           Compress-Archive -Path "dist/cli/*" -DestinationPath "dist/cc-same-cli-$version-windows-x64.zip"
           Remove-Item -Recurse dist/app, dist/cli
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.name }}
           path: |
@@ -116,8 +118,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -127,7 +129,9 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           awk -v v="$version" '$1 == "##" && f { exit } $1 == "##" && $2 == v { f = 1; next } f' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md" || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
-      - uses: softprops/action-gh-release@v2
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           body_path: ${{ runner.temp }}/notes.md

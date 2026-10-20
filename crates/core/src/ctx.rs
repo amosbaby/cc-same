@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::model::Record;
 use crate::paths::Paths;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -62,7 +62,7 @@ impl Logger {
                 if let Some(parent) = path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+                if let Ok(mut f) = crate::fsx::open_private_append(path) {
                     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                     let _ = writeln!(f, "{now} {msg}");
                 }

@@ -154,8 +154,26 @@ fn client(timeout: Duration) -> anyhow::Result<reqwest::blocking::Client> {
         .user_agent(format!("CC-Same/{VERSION} (+https://github.com/songkeys/cc-same)"))
         .connect_timeout(Duration::from_secs(20))
         .timeout(timeout)
+        // Never plain http, and redirects only within GitHub's release hosts.
+        .https_only(!cfg!(test))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let allowed = attempt.url().scheme() == "https"
+                && matches!(
+                    attempt.url().host_str(),
+                    Some(
+                        "github.com"
+                            | "api.github.com"
+                            | "objects.githubusercontent.com"
+                            | "release-assets.githubusercontent.com"
+                    )
+                );
+            if attempt.previous().len() >= 10 || !allowed { attempt.stop() } else { attempt.follow() }
+        }))
         .build()?)
 }
+
+/// Where release archives may come from.
+const RELEASE_DOWNLOADS: &str = "https://github.com/songkeys/cc-same/releases/download/";
 
 /// Where the latest release is described: GitHub, unless a development build is pointed at a
 /// test feed (`CC_SAME_UPDATE_FEED`) to try updates.
@@ -208,7 +226,12 @@ fn parse(json: &Value) -> anyhow::Result<Release> {
     Ok(Release {
         version,
         notes: json["body"].as_str().unwrap_or_default().trim().to_string(),
-        page: json["html_url"].as_str().unwrap_or(DOWNLOADS).to_string(),
+        // Opened in the browser: only a GitHub page.
+        page: json["html_url"]
+            .as_str()
+            .filter(|u| u.starts_with("https://github.com/"))
+            .unwrap_or(DOWNLOADS)
+            .to_string(),
         asset,
     })
 }
@@ -232,6 +255,16 @@ fn archive_name(version: &Version) -> Option<String> {
 /// Download `asset` into `dir` (emptied first), counting the bytes into `progress`, and check its
 /// size and digest.
 pub fn download(asset: &Asset, dir: &Path, progress: &AtomicU64) -> Outcome<PathBuf> {
+    // Fail closed: an archive without a published digest, or from anywhere but this project's
+    // releases, is never downloaded.
+    let Some(expected) = &asset.sha256 else {
+        return Err(Failure::new(Problem::Unverified, anyhow!("GitHub lists no SHA-256 digest for {}", asset.name)));
+    };
+    if !cfg!(test) && !(cfg!(debug_assertions) && std::env::var_os("CC_SAME_UPDATE_FEED").is_some()) {
+        if !asset.url.starts_with(RELEASE_DOWNLOADS) {
+            return Err(Failure::new(Problem::Unverified, anyhow!("unexpected download location {}", asset.url)));
+        }
+    }
     let _ = fs::remove_dir_all(dir);
     fsx::create_private_dir_all(dir).because(Problem::Other)?;
     let path = dir.join(&asset.name);
@@ -261,12 +294,10 @@ pub fn download(asset: &Asset, dir: &Path, progress: &AtomicU64) -> Outcome<Path
         let error = anyhow!("the download of {} stopped at {total} of {} bytes", asset.name, asset.size);
         return Err(Failure::new(Problem::Offline, error));
     }
-    if let Some(expected) = &asset.sha256 {
-        let actual = format!("{:x}", hasher.finalize());
-        if actual != *expected {
-            let error = anyhow!("{} has the SHA-256 {actual}, not {expected}", asset.name);
-            return Err(Failure::new(Problem::Unverified, error));
-        }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != *expected {
+        let error = anyhow!("{} has the SHA-256 {actual}, not {expected}", asset.name);
+        return Err(Failure::new(Problem::Unverified, error));
     }
     Ok(path)
 }
@@ -281,8 +312,9 @@ pub fn unpack(archive: &Path, version: &Version, target: &Path) -> Outcome<PathB
     fs::create_dir_all(&dir).because(Problem::Other)?;
     platform::extract(archive, &dir).because(Problem::Unverified)?;
     let (staged, program) = platform::find(&dir).because(Problem::Unverified)?;
-    check_version(&program, version).because(Problem::Unverified)?;
+    // Nothing downloaded runs before its signature is checked.
     platform::check_signature(&staged, target).because(Problem::Unverified)?;
+    check_version(&program, version).because(Problem::Unverified)?;
     Ok(staged)
 }
 
@@ -512,6 +544,16 @@ mod platform {
                 if theirs.as_deref() != Some(ours.as_str()) {
                     bail!("the new copy is signed by team {theirs:?}, not {ours}");
                 }
+                // `TeamIdentifier` alone can be copied into a self-made certificate: require a
+                // Developer ID certificate issued by Apple to that team, and Gatekeeper's approval.
+                anyhow::ensure!(ours.bytes().all(|b| b.is_ascii_alphanumeric()), "odd team id {ours}");
+                let requirement = format!(
+                    "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = \"{ours}\""
+                );
+                run(Command::new("/usr/bin/codesign")
+                    .args(["--verify", "--deep", "--strict", "-R", &requirement])
+                    .arg(app))?;
+                run(Command::new("/usr/sbin/spctl").args(["--assess", "--type", "execute"]).arg(app))?;
             }
             // A development build trying updates takes another local build as it is.
             (None, None) if self_managing() && cfg!(debug_assertions) => {}

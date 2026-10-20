@@ -3,6 +3,25 @@
 What changed in each version of CC Same. The app shows these notes after it updates, and under
 Settings › Updates.
 
+## Unreleased (hardened fork)
+
+### Security
+
+- `cc-same config --only <account>/<org>` syncs only the listed accounts and orgs; everything
+  else stays separate, including accounts that appear later and on the first sync.
+- An `exclude` or `only` entry that is not a full id stops syncing instead of matching nothing.
+  `config` expands a unique prefix (like the 8 characters `doctor` shows) to the full id.
+- `cc-same orgs` lists every account/org on this computer with full ids.
+- Accounts that appear later no longer join by default (`autoJoinNew` is off).
+- Account switching (`switch`, `add`, `remove`, `alias`, `disable`, `enable`, `move`) is left
+  out of the command-line tool unless built with `--features account-switching`.
+- The app no longer checks for or installs updates by default. Updates without a published
+  digest, from outside this project's releases, or over plain http are refused; the signature
+  is checked before anything downloaded runs, and on macOS against Apple's Developer ID chain.
+- Logs are created 0600; launch agent, systemd unit and autostart files are written atomically.
+- Release builds: actions pinned by commit, no build cache, `--locked`, signing identity
+  imported only after the build, `SHA256SUMS` published; CI runs `cargo audit`.
+
 ## 0.1.10 - 2026-10-05
 
 ### Added

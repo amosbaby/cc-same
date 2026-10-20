@@ -17,8 +17,8 @@ esac
 out="${CC_SAME_OUTPUT:-dist}"
 mkdir -p "$out"
 
-cargo build --release -p cc-same
-cargo build --release --manifest-path crates/app/Cargo.toml
+cargo build --release --locked -p cc-same
+cargo build --release --locked --manifest-path crates/app/Cargo.toml
 
 stage="$(mktemp -d)"
 root="$stage/cc-same-$version"

@@ -1,3 +1,22 @@
+> [!IMPORTANT]
+> **这是加固过的 fork。** 改动和审计结论见 [docs/security-audit.md](docs/security-audit.md)。
+> 与上游的区别：
+>
+> - 支持 `config --only` 白名单；
+> - 配置里有短 ID 或无效 ID 时拒绝同步，不再静默失效；
+> - 新账号默认不会自动加入；
+> - CLI 默认不包含账号切换；
+> - GUI 默认关闭自动更新，更新校验改为失败即拒绝。
+>
+> **一键安装**（macOS，需要 Rust）：
+>
+> ```bash
+> git clone <this-fork-url> cc-same && cd cc-same && ./scripts/secure-setup.sh
+> ```
+>
+> 脚本会列出本机的账号/组织，让你选择要同步的那几个，然后等你退出 Claude，展示同步计划，完成首次同步，并启动后台同步。
+> 停止同步：`cc-same uninstall`。
+
 <p align="center">
   <img src="assets/icon.png" width="112" alt="">
 </p>

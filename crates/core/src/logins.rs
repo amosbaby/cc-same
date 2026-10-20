@@ -184,6 +184,8 @@ pub fn switch(ctx: &Ctx, target: Target, watch: &desktop::Watch) -> Result<Switc
 
 /// Delete the sign-in saved for `account`.
 pub fn forget(ctx: &Ctx, account: &str) -> Result<()> {
+    // The id comes from `accounts.json`; anything but a uuid could point outside `logins`.
+    anyhow::ensure!(is_uuid(account), "not an account id: {account}");
     let _lock = crate::apply::Lock::acquire(ctx, Duration::from_secs(30))?;
     let dir = saved_dir(&ctx.paths, account);
     if dir.exists() {

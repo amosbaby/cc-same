@@ -68,7 +68,7 @@ pub fn take(ctx: &Ctx, reason: &str) -> Result<String> {
         version: crate::VERSION.into(),
         partitions: saved,
     };
-    fs::write(root.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    fsx::atomic_write(&root.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?, None, false)?;
     Ok(id)
 }
 
@@ -120,6 +120,11 @@ fn require_quit(ctx: &Ctx) -> Result<()> {
 /// after a `pre-restore` snapshot. Returns that snapshot's id.
 pub fn restore(ctx: &Ctx, id: &str) -> Result<String> {
     require_quit(ctx)?;
+    // An id is one folder name inside the snapshots folder.
+    anyhow::ensure!(
+        !id.is_empty() && !id.starts_with('.') && !id.contains(['/', '\\', ':']),
+        "not a snapshot id: {id}"
+    );
     let root = ctx.paths.snapshots_dir().join(id);
     let raw = fs::read(root.join("manifest.json")).with_context(|| format!("no such snapshot: {id}"))?;
     let manifest: Manifest = serde_json::from_slice(&raw)?;

@@ -21,7 +21,8 @@ fn show(text: &str) {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn show(text: &str) {
-    let _ = Command::new("notify-send").args(["CC Same", text]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ =
+        Command::new("notify-send").args(["--", "CC Same", text]).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
 /// Windows has no toast API without an app identity; the app shows the same hint in its window.

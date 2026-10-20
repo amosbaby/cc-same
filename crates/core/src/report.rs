@@ -53,6 +53,8 @@ pub enum Warning {
     MissingTranscripts { missing: usize, total: usize },
     /// Claude Desktop's data folder was not found.
     DesktopDataMissing { path: PathBuf },
+    /// `exclude`/`only` entries that are not full ids; syncing stops until they are fixed.
+    InvalidConfigEntries { entries: Vec<String> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -147,6 +149,10 @@ pub fn overview(ctx: &Ctx) -> Overview {
     let state = State::load(&ctx.paths);
     let labels = scan::account_labels(ctx);
     let mut warnings = Vec::new();
+    let invalid = cfg.invalid_entries();
+    if !invalid.is_empty() {
+        warnings.push(Warning::InvalidConfigEntries { entries: invalid });
+    }
     if !ctx.paths.user_data.is_dir() {
         warnings.push(Warning::DesktopDataMissing { path: ctx.paths.user_data.clone() });
     }

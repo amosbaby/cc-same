@@ -111,6 +111,26 @@ fn set_private(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Open a log file for appending: created 0600, never through a symlink. The log names
+/// accounts, orgs and file names, and on macOS it lives outside the private state folder.
+pub fn open_private_append(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if is_symlink(path) {
+        return Err(other(format!("refusing to write through a symlink: {}", path.display())));
+    }
+    let f = opts.open(path)?;
+    // Logs written by older versions were created with the default 0644.
+    set_private(&f)?;
+    Ok(f)
+}
+
 /// Write `payload` to `path` through a temporary file in the same folder, fsync it, give it
 /// `mtime_ns`, then rename it into place. With `no_clobber` an existing file is left alone and
 /// `Ok(false)` is returned. Never writes through a symlink.
@@ -190,6 +210,10 @@ pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
     let md = fs::symlink_metadata(src)?;
     if !md.is_file() {
         return Err(other(format!("not a regular file: {}", src.display())));
+    }
+    // A copy follows a symlink at `dst`; every caller copies into a fresh path.
+    if fs::symlink_metadata(dst).is_ok() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("already exists: {}", dst.display())));
     }
     reflink_copy::reflink_or_copy(src, dst)?;
     let f = OpenOptions::new().write(true).open(dst)?;

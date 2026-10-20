@@ -63,6 +63,11 @@ impl Env {
         env
     }
 
+    /// Let accounts that appear later join (off by default).
+    fn auto_join(&self) {
+        Config { auto_join_new: true, ..Config::default() }.save(&self.paths()).unwrap();
+    }
+
     fn paths(&self) -> Paths {
         let mut p = Paths::new(self.user_data.clone(), self.state_dir.clone());
         p.desktop_logs = self.logs.clone();
@@ -350,6 +355,7 @@ fn unknown_active_account_means_hands_off_everything() {
 #[test]
 fn first_join_seeds_a_loaded_new_account_additively() {
     let e = Env::new();
+    e.auto_join();
     let (x, y, z) = (uid(), uid(), uid());
     e.record(A, &x, 100_000, json!({"title": "x"}));
     e.record(B, &y, 100_000, json!({"title": "y"}));
@@ -504,6 +510,7 @@ fn collection_three_way_merge() {
     e.sync();
     assert_eq!(e.task_ids(B), ["t1", "t3"]);
     // a new account joining with its own task can add, not remove
+    e.auto_join();
     e.tasks(C, &["t9"], 400_000);
     e.sync();
     for p in [A, B, C] {
@@ -692,7 +699,7 @@ fn switching_accounts_while_claude_runs() {
     e.record(A, &x, 100_000, json!({"title": "v1"}));
     e.code(B);
     let paths = e.paths();
-    let config = Config { switch_grace_seconds: 0.0, notify: false, ..Config::default() };
+    let config = Config { switch_grace_seconds: 0.0, notify: false, auto_join_new: true, ..Config::default() };
     let ctx =
         Arc::new(Ctx::new(paths, config.clone(), FakeDesktop { running: Some(true), active: None }, LogSink::Silent));
     config.save(&ctx.paths).unwrap();
@@ -728,4 +735,43 @@ fn switching_accounts_while_claude_runs() {
     assert!(e.state_dir.join("agent.json").exists(), "the agent writes a heartbeat");
     stop.store(true, Ordering::Relaxed);
     agent.join().unwrap();
+}
+
+#[test]
+fn a_new_account_stays_out_unless_auto_join_is_on() {
+    let e = Env::new();
+    let (x, z) = (uid(), uid());
+    e.record(A, &x, 100_000, json!({"title": "x"}));
+    e.code(B);
+    e.sync();
+    // a personal account signs in later: by default it gets nothing, and gives nothing
+    e.record(C, &z, 300_000, json!({"title": "z made in C"}));
+    e.sync();
+    assert!(!e.user_data.join("claude-code-sessions").join(C.0).join(C.1).join(format!("local_{x}.json")).exists());
+    assert!(!e.user_data.join("claude-code-sessions").join(A.0).join(A.1).join(format!("local_{z}.json")).exists());
+}
+
+#[test]
+fn only_list_keeps_other_orgs_out_even_on_the_first_sync() {
+    let e = Env::new();
+    let (x, y) = (uid(), uid());
+    e.record(A, &x, 100_000, json!({"title": "x"}));
+    e.record(C, &y, 100_000, json!({"title": "y"}));
+    e.code(B);
+    Config { only: vec![key(A), key(B)], ..Config::default() }.save(&e.paths()).unwrap();
+    e.sync();
+    assert_eq!(e.read(B, &x)["title"], "x");
+    assert!(!e.user_data.join("claude-code-sessions").join(C.0).join(C.1).join(format!("local_{x}.json")).exists());
+    assert!(!e.user_data.join("claude-code-sessions").join(A.0).join(A.1).join(format!("local_{y}.json")).exists());
+}
+
+#[test]
+fn a_short_id_in_exclude_stops_syncing() {
+    let e = Env::new();
+    let x = uid();
+    e.record(A, &x, 100_000, json!({"title": "x"}));
+    e.code(B);
+    Config { exclude: vec![B.0[..8].to_string()], ..Config::default() }.save(&e.paths()).unwrap();
+    assert!(cc_same_core::apply::run_sync(&e.ctx(), "test").is_err());
+    assert!(!e.user_data.join("claude-code-sessions").join(B.0).join(B.1).join(format!("local_{x}.json")).exists());
 }

@@ -3,7 +3,7 @@
 //! in place.
 
 use crate::fsx;
-use crate::model::Surface;
+use crate::model::{is_uuid, Surface};
 use crate::paths::Paths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -16,6 +16,9 @@ use std::fs;
 pub struct Config {
     /// `<account>` or `<account>/<org>` entries that stay separate.
     pub exclude: Vec<String>,
+    /// When not empty, only these `<account>` or `<account>/<org>` entries take part; every
+    /// other account and org stays separate, including ones that appear later.
+    pub only: Vec<String>,
     /// Accounts and orgs that appear later join automatically.
     pub auto_join_new: bool,
     /// Rolling snapshots kept (the baseline is kept forever).
@@ -46,7 +49,9 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             exclude: Vec::new(),
-            auto_join_new: true,
+            only: Vec::new(),
+            // Off: an account signed in to later (a personal one, say) must be added on purpose.
+            auto_join_new: false,
             keep_snapshots: 20,
             snapshot_every_seconds: 3600.0,
             trash_days: 30.0,
@@ -55,8 +60,9 @@ impl Default for Config {
             appearance: "system".into(),
             language: "system".into(),
             tray: true,
-            check_updates: true,
-            auto_update: true,
+            // Off: updates are installed by hand after reading what changed.
+            check_updates: false,
+            auto_update: false,
         }
     }
 }
@@ -82,7 +88,34 @@ impl Config {
 
     pub fn is_excluded(&self, acct: &str, org: &str) -> bool {
         let key = format!("{acct}/{org}");
-        self.exclude.iter().any(|e| e == acct || *e == key)
+        let named = |list: &[String]| list.iter().any(|e| e == acct || *e == key);
+        named(&self.exclude) || (!self.only.is_empty() && !named(&self.only))
+    }
+
+    /// `exclude` and `only` entries that can never match a folder: anything but a full
+    /// `<account>` or `<account>/<org>` id. A short id in `exclude` would silently leave that
+    /// account syncing, so a sync refuses to run while there are any.
+    pub fn invalid_entries(&self) -> Vec<String> {
+        self.exclude.iter().chain(&self.only).filter(|e| !is_entry(e)).cloned().collect()
+    }
+
+    /// Fail when [`Config::invalid_entries`] finds any.
+    pub fn check(&self) -> Result<()> {
+        let bad = self.invalid_entries();
+        anyhow::ensure!(
+            bad.is_empty(),
+            "config has id(s) that match no folder: {} (use full ids: `cc-same orgs` lists them)",
+            bad.join(", ")
+        );
+        Ok(())
+    }
+}
+
+/// A full `<account>` or `<account>/<org>` id.
+pub fn is_entry(e: &str) -> bool {
+    match e.split_once('/') {
+        Some((acct, org)) => is_uuid(acct) && is_uuid(org),
+        None => is_uuid(e),
     }
 }
 
@@ -159,5 +192,83 @@ impl State {
 
     pub fn known(&self, surface: Surface) -> Vec<String> {
         self.known.get(surface.as_str()).cloned().unwrap_or_default()
+    }
+}
+
+/// Turn what someone typed for `exclude`/`only` into a full id: a full `<account>` or
+/// `<account>/<org>` id as it is, or a prefix of one (such as the 8 characters `doctor` shows)
+/// that names exactly one of the `known` account/org pairs.
+pub fn resolve_entry(input: &str, known: &[(String, String)]) -> Result<String> {
+    let input = input.trim().to_ascii_lowercase();
+    if is_entry(&input) {
+        return Ok(input);
+    }
+    let (acct, org) = match input.split_once('/') {
+        Some((a, o)) => (a, Some(o)),
+        None => (input.as_str(), None),
+    };
+    let prefix_ok = |s: &str| s.len() >= 4 && s.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit());
+    anyhow::ensure!(
+        prefix_ok(acct) && org.is_none_or(prefix_ok),
+        "`{input}` is not an id: use `<account>` or `<account>/<org>` (`cc-same orgs` lists them)"
+    );
+    let mut found: Vec<String> = known
+        .iter()
+        .filter(|(a, o)| a.starts_with(acct) && org.is_none_or(|p| o.starts_with(p)))
+        .map(|(a, o)| if org.is_some() { format!("{a}/{o}") } else { a.clone() })
+        .collect();
+    found.sort();
+    found.dedup();
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => anyhow::bail!("`{input}` matches no account or org on this computer (`cc-same orgs` lists them)"),
+        _ => anyhow::bail!("`{input}` matches more than one: {}", found.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const B: &str = "11111111-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const O1: &str = "22222222-1111-4111-8111-111111111111";
+    const O2: &str = "33333333-2222-4222-8222-222222222222";
+
+    fn known() -> Vec<(String, String)> {
+        vec![(A.into(), O1.into()), (A.into(), O2.into()), (B.into(), O1.into())]
+    }
+
+    #[test]
+    fn a_short_exclude_stops_the_sync_instead_of_matching_nothing() {
+        let cfg = Config { exclude: vec!["11111111".into(), format!("{A}/{O1}")], ..Config::default() };
+        assert_eq!(cfg.invalid_entries(), vec!["11111111".to_string()]);
+        assert!(cfg.check().is_err());
+        let cfg = Config { exclude: vec![A.into(), format!("{B}/{O1}")], ..Config::default() };
+        assert!(cfg.check().is_ok());
+    }
+
+    #[test]
+    fn only_keeps_everything_else_out() {
+        let cfg = Config { only: vec![format!("{A}/{O1}"), B.into()], ..Config::default() };
+        assert!(!cfg.is_excluded(A, O1));
+        assert!(cfg.is_excluded(A, O2));
+        assert!(!cfg.is_excluded(B, O2));
+        assert!(cfg.is_excluded("44444444-4444-4444-8444-444444444444", O1));
+        let cfg = Config { only: vec![format!("{A}/{O1}")], exclude: vec![A.into()], ..Config::default() };
+        assert!(cfg.is_excluded(A, O1), "exclude wins over only");
+    }
+
+    #[test]
+    fn prefixes_resolve_only_when_they_name_one_folder() {
+        let k = known();
+        assert_eq!(resolve_entry(&A.to_uppercase(), &k).unwrap(), A);
+        assert_eq!(resolve_entry("11111111-aaaa", &k).unwrap(), A);
+        assert_eq!(resolve_entry("11111111-a/3333", &k).unwrap(), format!("{A}/{O2}"));
+        assert!(resolve_entry("11111111", &k).is_err(), "two accounts share it");
+        assert!(resolve_entry("11111111-aaaa/", &k).is_err());
+        assert!(resolve_entry("9999", &k).is_err());
+        assert!(resolve_entry("../x", &k).is_err());
+        assert!(resolve_entry("abc", &k).is_err());
     }
 }
