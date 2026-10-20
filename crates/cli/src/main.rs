@@ -1,16 +1,17 @@
 //! `cc-same`: keep Claude Desktop's local sessions identical across all your accounts.
 
-use anyhow::{bail, Result};
-use cc_same_core::accounts::{self, Roster};
+use anyhow::{bail, Context as _, Result};
 #[cfg(feature = "account-switching")]
-use cc_same_core::accounts::{NotFound, Slot, Strategy};
+use cc_same_core::accounts::{self, NotFound, Roster, Slot, Strategy};
 use cc_same_core::desktop;
 #[cfg(feature = "account-switching")]
 use cc_same_core::desktop::Quitting;
+#[cfg(feature = "account-switching")]
 use cc_same_core::logins;
 use cc_same_core::report::{self, Overview, Warning};
 use cc_same_core::retention::{self, Kept, Limit};
 use cc_same_core::service::{self, Heartbeat};
+#[cfg(feature = "account-switching")]
 use cc_same_core::usage::Usage;
 use cc_same_core::watch::{self, WatchOptions};
 use cc_same_core::{apply, fsx, plan, scan, short, snapshot, Config, Ctx, FakeDesktop, LogSink, Paths, State, Surface};
@@ -61,6 +62,7 @@ enum Cmd {
         dry_run: bool,
     },
     /// Keep syncing (the background agent runs this)
+    #[command(hide = true)]
     Watch {
         /// Seconds between checks
         #[arg(long, default_value_t = 2.0)]
@@ -80,13 +82,28 @@ enum Cmd {
         dry_run: bool,
     },
     /// Stop background syncing (every account keeps its full copy)
-    Uninstall,
+    Uninstall {
+        /// Also delete CC Same's settings, snapshots, trash, undo history and logs
+        #[arg(long)]
+        purge: bool,
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Go back to how things were before the first sync, and stop syncing (quit Claude first)
+    Rollback {
+        #[arg(short, long)]
+        yes: bool,
+        /// Only show what would change
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Background sync and last sync
     Status,
     /// List snapshots
     Snapshots,
     /// Put every session index back as it was in a snapshot (quit Claude first)
     Restore {
+        /// Its id, its number in `cc-same snapshots` (1 = newest), or `baseline`
         snapshot: String,
         #[arg(short, long)]
         yes: bool,
@@ -112,11 +129,13 @@ enum Cmd {
     /// Turn syncing back on after `pause` or `undo`
     Resume,
     /// Turn symlinked index folders left by other tools into real folders (quit Claude first)
+    #[command(hide = true)]
     FixSymlinks {
         #[arg(short, long)]
         yes: bool,
     },
     /// Show how long Claude Code keeps transcripts; keep them, undo that, or set cleanupPeriodDays
+    #[command(hide = true)]
     Retention {
         /// Set cleanupPeriodDays (terminal sessions and other data)
         days: Option<u32>,
@@ -128,6 +147,7 @@ enum Cmd {
         undo: bool,
     },
     /// Your accounts, numbered: which one Claude is signed in to, and what each has used
+    #[cfg(feature = "account-switching")]
     #[command(visible_alias = "list")]
     Accounts {
         #[arg(long)]
@@ -254,12 +274,29 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     let detected = Paths::detect();
     let paths = Paths::new(cli.user_data.unwrap_or(detected.user_data), cli.state_dir.unwrap_or(detected.state_dir));
-    let config = Config::load(&paths)?;
-    let _ = ZH.set(wants_chinese(&config.language));
+    // The background agent keeps running on unreadable settings, syncing nothing and saying so;
+    // every other command stops.
+    let (config, problem) = match Config::load(&paths) {
+        Ok(c) => (c, None),
+        Err(e) if matches!(cli.cmd, Some(Cmd::Watch { .. })) => {
+            (Config { paused: true, ..Config::default() }, Some(format!("{e:#}")))
+        }
+        Err(e) => return Err(e),
+    };
+    let _ = ZH.set(config.chinese());
     let mut ctx = Ctx::new(paths, config, FakeDesktop::from_env(), LogSink::Stderr);
+    *ctx.config_problem.lock().unwrap() = problem;
     ctx.verbose = cli.verbose;
     let Some(cmd) = cli.cmd else {
-        return doctor(&ctx);
+        status(&ctx)?;
+        println!(
+            "\n{}",
+            tr(
+                "More: `cc-same doctor` checks everything, `cc-same --help` lists the commands.",
+                "更多：`cc-same doctor` 做完整检查，`cc-same --help` 列出所有命令。"
+            )
+        );
+        return Ok(());
     };
     match cmd {
         Cmd::Doctor => doctor(&ctx),
@@ -279,47 +316,13 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Install { yes, dry_run } => install(&ctx, yes, dry_run),
-        Cmd::Uninstall => {
-            service::uninstall(&ctx)?;
-            println!("Background sync removed. Every account keeps its full copy of your sessions.");
-            println!("Snapshots and trash stay in {}", ctx.paths.state_dir.display());
-            Ok(())
-        }
+        Cmd::Uninstall { purge, yes } => uninstall(&ctx, purge, yes),
+        Cmd::Rollback { yes, dry_run } => rollback(&ctx, yes, dry_run),
         Cmd::Status => status(&ctx),
         Cmd::Snapshots => snapshots(&ctx),
         Cmd::Restore { snapshot, yes, dry_run } => {
-            let manifest = snapshot::list(&ctx).into_iter().find(|m| m.id == snapshot);
-            let Some(m) = manifest else {
-                if zh() {
-                    bail!("没有这个快照：{snapshot}（用 `cc-same snapshots` 查看）");
-                }
-                bail!("no such snapshot: {snapshot} (see `cc-same snapshots`)")
-            };
-            if zh() {
-                println!("从 {} 恢复 {} 个会话文件夹。当前的文件夹会先放进回收站。", m.id, m.partitions.len());
-            } else {
-                println!(
-                    "Restore {} session folder(s) from {}. The current ones go to the trash first.",
-                    m.partitions.len(),
-                    m.id
-                );
-            }
-            let names = with_names(&ctx, scan::account_labels(&ctx));
-            for part in &m.partitions {
-                let key = format!("{}/{}", part.acct, part.org);
-                let Some(surface) = Surface::parse(&part.surface) else { continue };
-                let now = count_sessions(&ctx.paths.surface_root(surface).join(&part.acct).join(&part.org));
-                let then = count_sessions(
-                    &ctx.paths.snapshots_dir().join(&m.id).join(&part.surface).join(&part.acct).join(&part.org),
-                );
-                let who =
-                    names.get(&key).cloned().unwrap_or_else(|| format!("{}/{}", short(&part.acct), short(&part.org)));
-                if zh() {
-                    println!("  {who}：现在 {now} 个会话 → 恢复后 {then} 个");
-                } else {
-                    println!("  {who}: {now} sessions now -> {then} after the restore");
-                }
-            }
+            let m = find_snapshot(&ctx, &snapshot)?;
+            restore_preview(&ctx, &m);
             if dry_run {
                 println!("{}", tr("Dry run: nothing was changed.", "仅预览：没有做任何改动。"));
                 return Ok(());
@@ -327,6 +330,7 @@ fn run(cli: Cli) -> Result<()> {
             if !yes && !confirm(tr("Continue?", "继续吗？")) {
                 return Ok(());
             }
+            wait_for_quit(&ctx)?;
             let pre = snapshot::restore(&ctx, &m.id)?;
             if zh() {
                 println!("已恢复。恢复之前的状态保存在快照 {pre}。");
@@ -357,6 +361,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Retention { days, keep, undo } => retention(&ctx, days, keep, undo),
+        #[cfg(feature = "account-switching")]
         Cmd::Accounts { json } => accounts(&ctx, json),
         #[cfg(feature = "account-switching")]
         Cmd::Switch { account, strategy, json } => switch(&ctx, account.as_deref(), strategy.map(Into::into), json),
@@ -530,21 +535,6 @@ fn orgs(ctx: &Ctx, json: bool, tsv: bool) -> Result<()> {
 
 static ZH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Chinese output: `CC_SAME_LANG`, then the `language` setting, then the system locale.
-fn wants_chinese(setting: &str) -> bool {
-    let is_zh = |v: &str| v.trim().to_ascii_lowercase().starts_with("zh");
-    if let Some(v) = std::env::var("CC_SAME_LANG").ok().filter(|v| !v.trim().is_empty()) {
-        return is_zh(&v);
-    }
-    if setting != "system" && !setting.is_empty() {
-        return is_zh(setting);
-    }
-    ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-        .is_some_and(|v| is_zh(&v))
-}
-
 fn zh() -> bool {
     ZH.get().copied().unwrap_or(false)
 }
@@ -710,6 +700,7 @@ fn undo(ctx: &Ctx, run: Option<&str>, yes: bool, dry_run: bool, list: bool) -> R
     if !yes && !confirm(tr("Undo it?", "确定撤销吗？")) {
         return Ok(());
     }
+    wait_for_quit(ctx)?;
     let done = journal::undo(ctx, Some(&preview.id), false)?;
     if zh() {
         println!(
@@ -744,6 +735,168 @@ fn set_paused(ctx: &Ctx, paused: bool) -> Result<()> {
             (false, true) => "同步已恢复。",
         }
     );
+    Ok(())
+}
+
+/// What restoring snapshot `m` would change, per org.
+fn restore_preview(ctx: &Ctx, m: &snapshot::Manifest) {
+    if zh() {
+        println!("从 {} 恢复 {} 个会话文件夹。当前的文件夹会先放进回收站。", m.id, m.partitions.len());
+    } else {
+        println!(
+            "Restore {} session folder(s) from {}. The current ones go to the trash first.",
+            m.partitions.len(),
+            m.id
+        );
+    }
+    let names = with_names(ctx, scan::account_labels(ctx));
+    for part in &m.partitions {
+        let key = format!("{}/{}", part.acct, part.org);
+        let Some(surface) = Surface::parse(&part.surface) else { continue };
+        let now = count_sessions(&ctx.paths.surface_root(surface).join(&part.acct).join(&part.org));
+        let then =
+            count_sessions(&ctx.paths.snapshots_dir().join(&m.id).join(&part.surface).join(&part.acct).join(&part.org));
+        let who = names.get(&key).cloned().unwrap_or_else(|| format!("{}/{}", short(&part.acct), short(&part.org)));
+        if zh() {
+            println!("  {who}：现在 {now} 个会话 → 恢复后 {then} 个");
+        } else {
+            println!("  {who}: {now} sessions now -> {then} after the restore");
+        }
+    }
+}
+
+/// Wait in a terminal for Claude to quit (Ctrl+C stops); elsewhere, fail.
+fn wait_for_quit(ctx: &Ctx) -> Result<()> {
+    if !desktop::is_running(ctx) {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("{}", tr("quit Claude first, then try again", "请先退出 Claude 再试"));
+    }
+    println!(
+        "{}",
+        tr(
+            "Quit Claude (Cmd+Q) once its running tasks finish; waiting for it to close (Ctrl+C stops)...",
+            "请等 Claude 里正在运行的任务结束后，按 Cmd+Q 退出 Claude；正在等它关闭（按 Ctrl+C 中止）……"
+        )
+    );
+    while desktop::is_running(ctx) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+
+fn uninstall(ctx: &Ctx, purge: bool, yes: bool) -> Result<()> {
+    let state_dir = ctx.paths.state_dir.clone();
+    let logs: Vec<PathBuf> = [
+        ctx.paths.log_file.clone(),
+        ctx.paths.log_file.with_extension("log.1"),
+        ctx.paths.log_file.with_extension("agent.log"),
+    ]
+    .into_iter()
+    .filter(|p| !p.starts_with(&state_dir))
+    .collect();
+    if purge {
+        // Never anything as broad as the home folder or a root.
+        let home = cc_same_core::paths::home();
+        anyhow::ensure!(
+            state_dir.components().count() >= 3 && state_dir != home && !home.starts_with(&state_dir),
+            "refusing to delete {}",
+            state_dir.display()
+        );
+        if zh() {
+            println!("会删除 CC Same 的全部数据：{}（配置、快照、回收站、撤销记录）", state_dir.display());
+            if !logs.is_empty() {
+                println!("以及日志：{}", logs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("，"));
+            }
+            println!("删除后就无法再用 restore / undo / rollback 恢复。各组织的会话本身不受影响。");
+        } else {
+            println!(
+                "Deletes all of CC Same's data: {} (settings, snapshots, trash, undo history)",
+                state_dir.display()
+            );
+            if !logs.is_empty() {
+                println!(
+                    "and its logs: {}",
+                    logs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                );
+            }
+            println!(
+                "After that, restore / undo / rollback have nothing to go back to. Your sessions stay as they are."
+            );
+        }
+        if !yes && !confirm(tr("Delete it all?", "确定全部删除吗？")) {
+            return Ok(());
+        }
+    }
+    service::uninstall(ctx)?;
+    if purge {
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir).with_context(|| format!("deleting {}", state_dir.display()))?;
+        }
+        for p in &logs {
+            let _ = std::fs::remove_file(p);
+        }
+        if zh() {
+            println!("后台同步已移除，CC Same 的数据已删除。");
+            println!("程序本身用 `cargo uninstall cc-same` 删除。");
+        } else {
+            println!("Background sync removed and CC Same's data deleted.");
+            println!("Remove the program itself with `cargo uninstall cc-same`.");
+        }
+        return Ok(());
+    }
+    if zh() {
+        println!("后台同步已移除。每个组织都保留自己的完整会话副本。");
+        println!("快照和回收站还在 {}（`cc-same uninstall --purge` 可一并删除）", state_dir.display());
+    } else {
+        println!("Background sync removed. Every account keeps its full copy of your sessions.");
+        println!("Snapshots and trash stay in {} (`cc-same uninstall --purge` deletes them)", state_dir.display());
+    }
+    Ok(())
+}
+
+/// Back to the baseline snapshot (before the first sync), with syncing stopped.
+fn rollback(ctx: &Ctx, yes: bool, dry_run: bool) -> Result<()> {
+    let state = State::load(&ctx.paths);
+    let Some(m) = state.baseline.as_deref().and_then(|id| snapshot::list(ctx).into_iter().find(|m| m.id == id)) else {
+        bail!(
+            "{}",
+            tr(
+                "nothing to roll back: there was no sync yet (or its baseline snapshot is gone)",
+                "没有可回滚的内容：还没同步过（或基线快照已不在）"
+            )
+        );
+    };
+    println!("{}", tr("Rollback: back to before the first sync.", "回滚：回到首次同步之前。"));
+    restore_preview(ctx, &m);
+    println!(
+        "{}",
+        tr(
+            "Background sync is removed and syncing paused. Sessions made after the first sync leave the lists (their transcripts stay in ~/.claude/projects), and the state before the rollback is kept as a snapshot, so `cc-same restore 1` brings it back.",
+            "后台同步会被移除，同步暂停。首次同步之后新建的会话会从列表里消失（转录仍在 ~/.claude/projects）；回滚前的状态会另存为快照，`cc-same restore 1` 可以恢复回来。"
+        )
+    );
+    if dry_run {
+        println!("{}", tr("Dry run: nothing was changed.", "仅预览：没有做任何改动。"));
+        return Ok(());
+    }
+    if !yes && !confirm(tr("Roll back?", "确定回滚吗？")) {
+        return Ok(());
+    }
+    wait_for_quit(ctx)?;
+    service::uninstall(ctx)?;
+    let mut cfg = ctx.config();
+    cfg.paused = true;
+    cfg.save(&ctx.paths)?;
+    let pre = snapshot::restore(ctx, &m.id)?;
+    if zh() {
+        println!("已回滚，后台同步已移除。回滚前的状态在快照 {pre}。");
+        println!("要重新开始同步：cc-same resume && cc-same install");
+    } else {
+        println!("Rolled back and background sync removed. The state before is snapshot {pre}.");
+        println!("To sync again: cc-same resume && cc-same install");
+    }
     Ok(())
 }
 
@@ -1184,6 +1337,7 @@ fn install(ctx: &Ctx, yes: bool, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "account-switching")]
 /// Every account CC Same knows of, by ID, with its name: the list, then the ones only seen in
 /// Claude's session folders.
 fn known_accounts(ctx: &Ctx, roster: &Roster) -> BTreeMap<String, String> {
@@ -1226,6 +1380,7 @@ fn name_in(roster: &Roster, account: &str) -> String {
     roster.slot(account).map(Slot::label).unwrap_or_else(|| format!("Account {}", short(account)))
 }
 
+#[cfg(feature = "account-switching")]
 /// "5h 12% · 7d 58%, 2 min ago", or nothing when Claude has no reading.
 fn usage_text(usage: Option<&Usage>, now: f64) -> String {
     let Some(u) = usage else { return String::new() };
@@ -1242,6 +1397,7 @@ fn usage_text(usage: Option<&Usage>, now: f64) -> String {
     format!("{}, {}", parts.join(" · "), report::ago(u.at))
 }
 
+#[cfg(feature = "account-switching")]
 fn accounts(ctx: &Ctx, json: bool) -> Result<()> {
     let roster = accounts::observe(ctx);
     let found = logins::list(ctx);
@@ -1521,14 +1677,39 @@ fn snapshots(ctx: &Ctx) -> Result<()> {
     let state = State::load(&ctx.paths);
     let list = snapshot::list(ctx);
     if list.is_empty() {
-        println!("No snapshots yet. The first sync takes one.");
+        println!("{}", tr("No snapshots yet. The first sync takes one.", "还没有快照。首次同步时会自动做一份。"));
     }
-    for m in &list {
-        let baseline = if Some(&m.id) == state.baseline.as_ref() { "  (before the first sync)" } else { "" };
-        println!("{}  {} folder(s){baseline}", m.id, m.partitions.len());
+    // Newest first, numbered for `restore <n>`.
+    for (n, m) in list.iter().rev().enumerate() {
+        let baseline = Some(&m.id) == state.baseline.as_ref();
+        if zh() {
+            let mark = if baseline { "  （首次同步之前，可用 `restore baseline`）" } else { "" };
+            println!("{:>3}. {}  {}，{} 个文件夹{mark}", n + 1, m.id, ago(m.created), m.partitions.len());
+        } else {
+            let mark = if baseline { "  (before the first sync; `restore baseline`)" } else { "" };
+            println!("{:>3}. {}  {}, {} folder(s){mark}", n + 1, m.id, ago(m.created), m.partitions.len());
+        }
     }
-    println!("Location: {}", ctx.paths.snapshots_dir().display());
+    println!("{}{}", tr("Location: ", "位置："), ctx.paths.snapshots_dir().display());
     Ok(())
+}
+
+/// A snapshot by id, by its number in `cc-same snapshots` (1 = newest), or `baseline`.
+fn find_snapshot(ctx: &Ctx, which: &str) -> Result<snapshot::Manifest> {
+    let list = snapshot::list(ctx);
+    let id = match which.trim() {
+        "baseline" => State::load(&ctx.paths).baseline.unwrap_or_default(),
+        n if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            let i: usize = n.parse().unwrap_or(0);
+            list.iter().rev().nth(i.wrapping_sub(1)).map(|m| m.id.clone()).unwrap_or_default()
+        }
+        id => id.to_string(),
+    };
+    match list.into_iter().find(|m| m.id == id) {
+        Some(m) => Ok(m),
+        None if zh() => bail!("没有这个快照：{which}（用 `cc-same snapshots` 查看）"),
+        None => bail!("no such snapshot: {which} (see `cc-same snapshots`)"),
+    }
 }
 
 fn retention(ctx: &Ctx, days: Option<u32>, keep: bool, undo: bool) -> Result<()> {

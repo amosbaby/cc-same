@@ -862,3 +862,63 @@ mod undo {
         assert_eq!(journal::list(&e.ctx()).len(), before);
     }
 }
+
+mod agent {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn passes(ctx: &Ctx, n: u64) {
+        watch::run(
+            ctx,
+            &WatchOptions { interval: Duration::from_millis(10), iterations: Some(n) },
+            &AtomicBool::new(false),
+        );
+    }
+
+    #[test]
+    fn an_unreadable_config_stops_syncing_and_is_reported_once() {
+        let e = Env::new();
+        let x = uid();
+        e.record(A, &x, 100_000, json!({}));
+        e.code(B);
+        Config { only: vec![key(A), key(B)], ..Config::default() }.save(&e.paths()).unwrap();
+        let ctx = e.ctx();
+        fs::write(e.paths().config_file(), b"{ not json").unwrap();
+        passes(&ctx, 3);
+        assert!(!e.code(B).join(format!("local_{x}.json")).exists(), "nothing synced with broken settings");
+        assert!(State::load(&e.paths()).alerts.contains_key("config"));
+        // Fixed: syncing resumes and the alert clears.
+        Config { only: vec![key(A), key(B)], ..Config::default() }.save(&e.paths()).unwrap();
+        passes(&ctx, 2);
+        assert!(e.code(B).join(format!("local_{x}.json")).exists());
+        assert!(!State::load(&e.paths()).alerts.contains_key("config"));
+    }
+
+    #[test]
+    fn a_pause_is_remembered_for_the_long_pause_notice() {
+        let e = Env::new();
+        e.record(A, &uid(), 100_000, json!({}));
+        e.code(B);
+        Config { paused: true, ..Config::default() }.save(&e.paths()).unwrap();
+        passes(&e.ctx(), 2);
+        let alerts = State::load(&e.paths()).alerts;
+        assert!(alerts.contains_key("paused-since"));
+        assert!(!alerts.contains_key("paused"), "not a day yet");
+    }
+
+    #[test]
+    fn a_failing_sync_is_reported_and_cleared_once_it_works() {
+        let e = Env::new();
+        let x = uid();
+        e.record(A, &x, 100_000, json!({}));
+        e.code(B);
+        // A short id stops every sync.
+        Config { exclude: vec!["cccccccc".into()], ..Config::default() }.save(&e.paths()).unwrap();
+        let ctx = e.ctx();
+        passes(&ctx, 2);
+        assert!(State::load(&e.paths()).alerts.contains_key("sync"));
+        Config::default().save(&e.paths()).unwrap();
+        passes(&ctx, 2);
+        assert!(!State::load(&e.paths()).alerts.contains_key("sync"));
+    }
+}

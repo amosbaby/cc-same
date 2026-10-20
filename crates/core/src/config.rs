@@ -92,6 +92,21 @@ impl Config {
         Ok(())
     }
 
+    /// Chinese output and notifications: `CC_SAME_LANG`, then `language`, then the locale.
+    pub fn chinese(&self) -> bool {
+        let is_zh = |v: &str| v.trim().to_ascii_lowercase().starts_with("zh");
+        if let Some(v) = std::env::var("CC_SAME_LANG").ok().filter(|v| !v.trim().is_empty()) {
+            return is_zh(&v);
+        }
+        if self.language != "system" && !self.language.is_empty() {
+            return is_zh(&self.language);
+        }
+        ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+            .is_some_and(|v| is_zh(&v))
+    }
+
     pub fn is_excluded(&self, acct: &str, org: &str) -> bool {
         let key = format!("{acct}/{org}");
         let named = |list: &[String]| list.iter().any(|e| e == acct || *e == key);
@@ -157,6 +172,12 @@ pub struct State {
     pub last_sync: Option<LastSync>,
     /// Partitions we already told the user to restart Claude for.
     pub notified: Vec<String>,
+    /// Problems the background agent already notified about (key -> when), so each is told once
+    /// until it clears.
+    pub alerts: BTreeMap<String, f64>,
+    /// Whether notifications were in Chinese the last time the settings could be read, for
+    /// telling that they cannot.
+    pub chinese: Option<bool>,
     /// Sessions were copied into the index Claude has open; they show after it reloads.
     pub pending_restart: Option<PendingRestart>,
     #[serde(flatten)]

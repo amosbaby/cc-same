@@ -28,6 +28,7 @@
 | 8 | 低 | LaunchAgent plist、systemd unit、autostart 文件用 `fs::write` 写入，会跟随 symlink | **已修复**：改为原子写入，并拒绝写穿 symlink |
 | 9 | 低 | `clone_file` 在目标已存在（包括 symlink）时会写穿 | **已修复**：目标已存在就拒绝 |
 | 10 | 低 | `restore <id>` 的核心函数不校验 id，可以带路径分隔符；快照 manifest 用默认权限写入；heartbeat 文件读取没有大小上限；`notify-send` 的参数没有用 `--` 隔开 | **已修复** |
+| 10a | 中 | 后台进程启动时如果 `config.json` 读不出来，会退回默认配置，`only` 白名单随之失效；只靠 `state.json` 兜底，状态文件再丢失的话，本机所有组织都会被同步 | **已修复**：读不出配置时一律不同步，弹一次通知；配置修好后立即恢复同步 |
 | 11 | 信息 | 快照（含永久保留的基线快照）和回收站里有会话元数据（标题、路径等）的副本，位于 `0700` 的私有目录 | 设计如此；卸载后如需清除，删除状态目录即可 |
 | 12 | 信息 | `CC_SAME_FAKE_RUNNING` 等测试用环境变量在 release 构建中仍然生效 | 只有同一用户能设置，可以接受 |
 | 13 | 信息 | GUI 依赖链里有几个"不再维护"的 crate（`paste`、`instant`、`rustybuzz` 等，都来自 GPUI） | 不影响 CLI；GUI 不建议在公司设备上使用 |

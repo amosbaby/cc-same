@@ -101,6 +101,8 @@ pub struct Ctx {
     pub fake: FakeDesktop,
     pub logger: Logger,
     pub verbose: bool,
+    /// Why `config.json` cannot be read right now; nothing syncs until it can.
+    pub config_problem: Mutex<Option<String>>,
     pub(crate) caches: Caches,
 }
 
@@ -112,6 +114,7 @@ impl Ctx {
             fake,
             logger: Logger::new(sink),
             verbose: false,
+            config_problem: Mutex::new(None),
             caches: Caches::default(),
         }
     }
@@ -131,11 +134,20 @@ impl Ctx {
         *self.config.write().unwrap() = config;
     }
 
-    /// Re-read `config.json` (the agent does this every pass).
+    /// Re-read `config.json` (the agent does this every pass). While it cannot be read, the
+    /// last good settings stay, and [`Ctx::config_problem`] says why.
     pub fn reload_config(&self) -> anyhow::Result<()> {
-        let cfg = Config::load(&self.paths)?;
-        self.set_config(cfg);
-        Ok(())
+        match Config::load(&self.paths) {
+            Ok(cfg) => {
+                self.set_config(cfg);
+                *self.config_problem.lock().unwrap() = None;
+                Ok(())
+            }
+            Err(e) => {
+                *self.config_problem.lock().unwrap() = Some(format!("{e:#}"));
+                Err(e)
+            }
+        }
     }
 
     pub fn log(&self, msg: impl AsRef<str>) {

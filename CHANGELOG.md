@@ -28,12 +28,33 @@ Settings › Updates.
   is then paused, since the other orgs would bring it all back: `cc-same resume` turns it on
   again, `cc-same pause` pauses by hand. The last 50 syncs are kept, none older than `trashDays`.
 - `--dry-run` for `sync`, `install`, `restore` and `undo`.
+- `cc-same rollback [--dry-run]`: back to the baseline snapshot (before the first sync), with
+  the background agent removed and syncing paused.
+- `cc-same uninstall --purge` also deletes CC Same's settings, snapshots, trash, undo history
+  and logs.
+- The background agent notifies once (in Chinese when set) when a sync fails, when its
+  settings cannot be read, when session files cannot be read (Desktop may have changed their
+  format), and when syncing has been paused for a day.
+- `cc-same snapshots` numbers them; `restore 1` (newest) and `restore baseline` work.
+- `undo`, `restore` and `rollback` wait for Claude to quit instead of failing.
+- `cc-same` without a command shows a short status; `watch`, `fix-symlinks` and `retention`
+  are hidden from `--help`.
+- `scripts/secure-setup.sh`: on a second run it keeps the settings and only updates the
+  program; waits for a second org instead of giving up; says what to do when the first sync
+  fails.
 
 ### Fixed
 
 - `status` reported 0 changes after a sync that made some: the last, empty round of a run
   overwrote the count.
 - Output piped into `head` and the like no longer ends in a panic.
+- Unreadable settings no longer mean default settings: the agent kept no `only` list and, without
+  `state.json`, would have synced every org. It now syncs nothing until they can be read, and
+  syncs again as soon as they can.
+- `scripts/secure-setup.sh` uses the program it just built, not whichever `cc-same` comes first
+  on `PATH`, builds from the repository root so the pinned toolchain always applies, and
+  reports a failing `cc-same orgs` instead of "fewer than two orgs".
+- `accounts` (which pointed at the left-out `cc-same add`) is part of `account-switching`.
 - Accounts that appear later no longer join by default (`autoJoinNew` is off).
 - Account switching (`switch`, `add`, `remove`, `alias`, `disable`, `enable`, `move`) is left
   out of the command-line tool unless built with `--features account-switching`.

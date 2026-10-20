@@ -4,6 +4,7 @@
 #   ./scripts/secure-setup.sh                                    # 从列表里选组织
 #   ./scripts/secure-setup.sh --org ACCT/ORG --org ACCT/ORG      # 直接指定（完整 ID 或唯一前缀）
 #   ./scripts/secure-setup.sh --org ACCT/ORG=名字 --org ACCT/ORG=名字 --yes   # 全程不提问
+#   ./scripts/secure-setup.sh                                    # 已装过：默认保持设置，只更新程序
 #
 # 按顺序做这些事：
 #   1. 用锁定的依赖版本从本仓库编译安装 `cc-same`（不含 GUI、自动更新和账号切换）；
@@ -12,7 +13,7 @@
 #   4. 等 Claude 退出，展示同步计划，确认后首次同步（之前会先做一份永久保留的基线快照），
 #      然后启动后台同步。
 #
-# 随时可以撤销：`cc-same uninstall`（每个组织都保留自己的完整会话副本）。
+# 随时可以撤销：`cc-same rollback` 回到安装前；`cc-same uninstall` 只停掉同步（每个组织都保留自己的完整会话副本）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,7 +23,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --org) ORGS+=("$2"); shift 2 ;;
         --yes|-y) YES=1; shift ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "未知参数：$1" >&2; exit 2 ;;
     esac
 done
@@ -35,6 +36,13 @@ ask() {
     read -r -p "$1 [y/N] " reply </dev/tty
     case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
+# 默认"是"的提问
+ask_yes() {
+    [ "$YES" = 1 ] && return 0
+    local reply
+    read -r -p "$1 [Y/n] " reply </dev/tty
+    case "$reply" in n|N|no|NO) return 1 ;; *) return 0 ;; esac
+}
 
 # ---------------------------------------------------------------- 1. 编译安装
 command -v cargo >/dev/null 2>&1 || die "没有安装 Rust。请先安装（https://rustup.rs，或 brew install rustup && rustup-init），再重新运行。"
@@ -42,11 +50,18 @@ say "编译 cc-same（$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || ech
 if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
     echo "提示：这个目录有本地改动，会按改动后的代码编译。"
 fi
-cargo install --locked --force --path "$ROOT/crates/cli" --bin cc-same
-BIN="$(command -v cc-same || true)"
-[ -n "$BIN" ] || BIN="${CARGO_HOME:-$HOME/.cargo}/bin/cc-same"
-[ -x "$BIN" ] || die "cc-same 已编译，但不在 PATH 里；请把 ${CARGO_HOME:-$HOME/.cargo}/bin 加入 PATH"
+# 在仓库根目录里编译，rust-toolchain.toml 才会生效，每次都用同一个编译器版本。
+(cd "$ROOT" && cargo install --locked --force --root "${CARGO_HOME:-$HOME/.cargo}" --path crates/cli --bin cc-same)
+# 直接用刚编译出来的这个，不按 PATH 找：PATH 里可能先排着别的 cc-same（比如上游版）。
+BIN="${CARGO_HOME:-$HOME/.cargo}/bin/cc-same"
+[ -x "$BIN" ] || die "编译完成，但没有在 $BIN 找到 cc-same"
 "$BIN" --version
+ON_PATH="$(command -v cc-same || true)"
+if [ -z "$ON_PATH" ]; then
+    echo "提示：${BIN%/*} 不在 PATH 里。以后手动运行时请用完整路径 $BIN，或把它加入 PATH。"
+elif [ "$ON_PATH" != "$BIN" ]; then
+    echo "注意：PATH 里的 cc-same 是 $ON_PATH，不是刚编译的这个。以后手动运行时请用 $BIN，或调整 PATH。"
+fi
 if "$BIN" --help | grep -qE '^  (switch|add) '; then
     die "这个 cc-same 编译进了账号切换功能；请去掉 --features account-switching 重新编译"
 fi
@@ -70,13 +85,48 @@ show_orgs() {
         printf '    ID：%s\n' "$id"
         if [ "$recent" != "-" ]; then printf '    最近会话：%s\n' "$recent"; fi
     done <<EOF
-$("$BIN" orgs --tsv)
+$TSV
 EOF
 }
+# 先单独取列表：命令失败时如实报错，而不是当成"没有组织"。
+list_orgs() {
+    TSV="$("$BIN" orgs --tsv)" || die "列出账号/组织失败（错误见上方）。可以运行 cc-same doctor 查看原因。"
+}
+count_orgs() {
+    local n=0 id
+    while IFS=$'\t' read -r id _; do
+        case "$id" in */*) n=$((n + 1)) ;; esac
+    done <<EOF
+$TSV
+EOF
+    echo "$n"
+}
+
+# ---------------------------------------------------------------- 已装过：默认只更新程序
+CONFIG="$("$BIN" config)" || die "读取现有配置失败（错误见上方）"
+if [ "${#ORGS[@]}" -eq 0 ] && printf '%s' "$CONFIG" | tr -d '\n' | grep -q '"only": \[ *"'; then
+    list_orgs
+    say "已经装过，现在只同步这些组织："
+    show_orgs
+    if ask_yes "保持现有设置，只更新程序和后台同步吗？（选 n 重新选择组织）"; then
+        "$BIN" install --yes || die "更新后台同步失败（错误见上方）。如果同步处于暂停状态，先运行 cc-same resume。"
+        say "已更新"
+        "$BIN" status
+        exit 0
+    fi
+fi
 
 say "本机的账号/组织"
+list_orgs
 show_orgs
-[ "${#IDS[@]}" -ge 2 ] || die "找到的账号/组织少于两个。请打开 Claude，在每个组织里各用一次（随便开一个会话），然后重新运行。"
+if [ "$(count_orgs)" -lt 2 ]; then
+    say "只找到 $(count_orgs) 个组织。请在 Claude 里切换到另一个组织（如果还是没出现，就在那个组织里随便开一个会话）；正在等待（按 Ctrl+C 中止）"
+    while [ "$(count_orgs)" -lt 2 ]; do
+        sleep 3
+        list_orgs
+    done
+    show_orgs
+fi
 
 if [ "${#ORGS[@]}" -eq 0 ]; then
     [ "$YES" = 0 ] || die "使用 --yes 时，需要用 --org 指定每个要同步的组织"
@@ -140,16 +190,22 @@ fi
 say "首次同步会做的改动"
 "$BIN" plan
 ask "现在同步，并在后台持续保持这些组织一致吗？" || { echo "已停止，没有同步任何内容；上面的设置已保存。"; exit 0; }
-"$BIN" sync --yes
-"$BIN" install --yes
+"$BIN" sync --yes || die "首次同步没有完成（错误见上方）。设置已保存，后台同步还没开启。
+  查看原因：cc-same doctor
+  撤销已做的部分：cc-same undo --dry-run，然后 cc-same undo
+  修好后重新运行本脚本即可。"
+"$BIN" install --yes || die "首次同步已完成，但后台同步没有开启（错误见上方）。修好后运行 cc-same install 即可。"
 say "完成"
 "$BIN" status
 cat <<EOF
 
 重新打开 Claude，照常在 Claude 里切换组织即可，后台会保持两边的会话列表一致。
   查看状态：cc-same doctor        cc-same orgs
-  撤销：    cc-same undo --dry-run   cc-same undo   （撤销最近一次同步；先退出 Claude）
-  快照：    cc-same snapshots     cc-same restore <id>   （先退出 Claude）
+  出问题时：cc-same rollback --dry-run，然后 cc-same rollback   （回到安装前，并停止同步）
+  撤销：    cc-same undo --dry-run   cc-same undo   （只撤销最近一次同步）
+  快照：    cc-same snapshots     cc-same restore 1   （先退出 Claude；1 是最新的快照）
+  暂停：    cc-same pause         cc-same resume
   改名字：  cc-same config --name <账号>/<组织>=<名字>
-  停止同步：cc-same uninstall     （每个组织都保留完整副本）
+  停止同步：cc-same uninstall     （每个组织都保留完整副本；加 --purge 连同 cc-same 的数据一起删除）
+  更新：    git pull && ./scripts/secure-setup.sh   （默认保持现有设置）
 EOF

@@ -101,10 +101,97 @@ pub fn run_agent(args: impl IntoIterator<Item = std::ffi::OsString>) {
     }
     let detected = Paths::detect();
     let paths = Paths::new(user_data.unwrap_or(detected.user_data), state_dir.unwrap_or(detected.state_dir));
-    let config = Config::load(&paths).unwrap_or_default();
+    // Unreadable settings must not mean default settings (no `only` list): nothing syncs until
+    // they can be read again.
+    let (config, problem) = match Config::load(&paths) {
+        Ok(c) => (c, None),
+        Err(e) => (Config { paused: true, ..Config::default() }, Some(format!("{e:#}"))),
+    };
     let log = LogSink::File(paths.log_file.clone());
     let ctx = Ctx::new(paths, config, FakeDesktop::from_env(), log);
+    *ctx.config_problem.lock().unwrap() = problem;
     run(&ctx, &WatchOptions::default(), &AtomicBool::new(false));
+}
+
+const ALERT_CONFIG: &str = "config";
+const ALERT_SYNC: &str = "sync";
+const ALERT_UNREADABLE: &str = "unreadable";
+const ALERT_PAUSED: &str = "paused";
+/// When the agent first saw syncing paused (not itself notified).
+const ALERT_PAUSED_SINCE: &str = "paused-since";
+/// A pause longer than this is pointed out once.
+const LONG_PAUSE: f64 = 24.0 * 3600.0;
+
+/// Remember the notification language while the settings can be read.
+fn remember_language(ctx: &Ctx) {
+    let chinese = ctx.config().chinese();
+    let mut state = State::load(&ctx.paths);
+    if state.chinese != Some(chinese) {
+        state.chinese = Some(chinese);
+        let _ = state.save(&ctx.paths);
+    }
+}
+
+/// Notify about a problem once, until [`clear_alert`] says it is gone.
+fn alert(ctx: &Ctx, key: &str, en: &str, zh: &str) {
+    let mut state = State::load(&ctx.paths);
+    if state.alerts.contains_key(key) {
+        return;
+    }
+    let chinese = if ctx.config_problem.lock().unwrap().is_some() {
+        state.chinese.unwrap_or_else(|| ctx.config().chinese())
+    } else {
+        ctx.config().chinese()
+    };
+    notify(ctx, if chinese { zh } else { en });
+    state.alerts.insert(key.into(), fsx::now_secs());
+    let _ = state.save(&ctx.paths);
+}
+
+fn clear_alert(ctx: &Ctx, key: &str) {
+    let mut state = State::load(&ctx.paths);
+    if state.alerts.remove(key).is_some() {
+        let _ = state.save(&ctx.paths);
+    }
+}
+
+fn sync_failed(ctx: &Ctx, error: &str) {
+    let short: String = error.chars().take(160).collect();
+    alert(
+        ctx,
+        ALERT_SYNC,
+        &format!("CC Same could not sync: {short}. Run `cc-same doctor` to see more."),
+        &format!("CC Same 同步失败：{short}。运行 `cc-same doctor` 查看详情。"),
+    );
+}
+
+/// Session files that cannot be read usually mean Claude Desktop changed its format.
+fn check_unreadable(ctx: &Ctx, plan: &crate::model::Plan) {
+    if plan.notes.iter().any(|n| n.contains("unreadable") || n.contains("skipped (")) {
+        alert(
+            ctx,
+            ALERT_UNREADABLE,
+            "Some Claude session files cannot be read and are left alone; Claude Desktop may have changed their format. Run `cc-same doctor`.",
+            "有些 Claude 会话文件读不了，已跳过不处理；可能是 Claude Desktop 升级后改了格式。运行 `cc-same doctor` 查看。",
+        );
+    } else {
+        clear_alert(ctx, ALERT_UNREADABLE);
+    }
+}
+
+/// Point out once that syncing has been paused for a day.
+fn check_long_pause(ctx: &Ctx) {
+    let mut state = State::load(&ctx.paths);
+    let since = *state.alerts.entry(ALERT_PAUSED_SINCE.into()).or_insert_with(fsx::now_secs);
+    let _ = state.save(&ctx.paths);
+    if fsx::now_secs() - since > LONG_PAUSE {
+        alert(
+            ctx,
+            ALERT_PAUSED,
+            "CC Same has been paused for a day; your orgs are not kept in sync. `cc-same resume` turns it back on.",
+            "CC Same 已暂停超过一天，组织之间没有在同步。用 `cc-same resume` 恢复。",
+        );
+    }
 }
 
 fn sleep_while(stop: &AtomicBool, total: Duration) {
@@ -125,6 +212,8 @@ pub fn run(ctx: &Ctx, opts: &WatchOptions, stop: &AtomicBool) {
     let mut last_running: Option<bool> = None;
     let mut passes = 0u64;
     let mut paused_logged = false;
+    let mut last_config_error: Option<String> = None;
+    let mut was_blocked = false;
     // The heartbeat has a thread of its own, from the start: a long first sync must not make a
     // working agent look dead to the app.
     let done = AtomicBool::new(false);
@@ -147,9 +236,33 @@ pub fn run(ctx: &Ctx, opts: &WatchOptions, stop: &AtomicBool) {
         });
         while !stop.load(Ordering::Relaxed) {
             passes += 1;
-            if let Err(e) = ctx.reload_config() {
-                ctx.debug(format!("config: {e}"));
+            match ctx.reload_config() {
+                Ok(()) => {
+                    last_config_error = None;
+                    clear_alert(ctx, ALERT_CONFIG);
+                    remember_language(ctx);
+                }
+                Err(e) => {
+                    let msg = format!("config: {e:#}");
+                    if last_config_error.as_deref() != Some(msg.as_str()) {
+                        ctx.log(&msg);
+                        last_config_error = Some(msg);
+                    }
+                    alert(
+                        ctx,
+                        ALERT_CONFIG,
+                        "CC Same cannot read its settings, so it stopped syncing. Run `cc-same doctor` to see why.",
+                        "CC Same 读不了自己的配置文件，已停止同步。运行 `cc-same doctor` 查看原因。",
+                    );
+                }
             }
+            let config_ok = ctx.config_problem.lock().unwrap().is_none();
+            // Back from a pause or from unreadable settings: sync now, not at the next change.
+            let blocked = !config_ok || ctx.config().paused;
+            if was_blocked && !blocked {
+                last_fp = None;
+            }
+            was_blocked = blocked;
             let running = desktop::is_running(ctx);
             let mut fp = fingerprint(ctx, running);
             let quit_edge = last_running == Some(true) && !running;
@@ -166,9 +279,16 @@ pub fn run(ctx: &Ctx, opts: &WatchOptions, stop: &AtomicBool) {
                         fp = next;
                     }
                 }
-                if ctx.config().paused {
+                if !config_ok || ctx.config().paused {
+                    if config_ok {
+                        check_long_pause(ctx);
+                    }
                     if !paused_logged {
-                        ctx.log("syncing is paused; `cc-same resume` turns it back on");
+                        ctx.log(if config_ok {
+                            "syncing is paused; `cc-same resume` turns it back on"
+                        } else {
+                            "not syncing: the settings cannot be read"
+                        });
                         paused_logged = true;
                     }
                     last_fp = Some(fp);
@@ -181,13 +301,21 @@ pub fn run(ctx: &Ctx, opts: &WatchOptions, stop: &AtomicBool) {
                     continue;
                 }
                 paused_logged = false;
+                clear_alert(ctx, ALERT_PAUSED_SINCE);
+                clear_alert(ctx, ALERT_PAUSED);
                 let state = State::load(&ctx.paths);
                 let app = desktop::detect(ctx);
                 ensure_active_partition(ctx, &app, &state);
                 // An account Claude signs in to joins the list even with no window open.
                 crate::accounts::observe(ctx);
                 match apply::run_sync(ctx, "watch") {
-                    Ok((_, out)) => {
+                    Ok((plan, out)) => {
+                        if out.errors.is_empty() {
+                            clear_alert(ctx, ALERT_SYNC);
+                        } else {
+                            sync_failed(ctx, &out.errors[0]);
+                        }
+                        check_unreadable(ctx, &plan);
                         if out.applied_total() > 0 || !out.errors.is_empty() {
                             let kinds: Vec<String> = out.applied.iter().map(|(k, n)| format!("{k:?} {n}")).collect();
                             ctx.log(format!(
@@ -203,13 +331,21 @@ pub fn run(ctx: &Ctx, opts: &WatchOptions, stop: &AtomicBool) {
                         for (key, n) in &out.seeded_while_loaded {
                             let mut st = State::load(&ctx.paths);
                             if *n > 0 && !st.notified.contains(key) {
-                                notify(ctx, &format!("Copied {n} session(s) from your other accounts into the one Claude has open. Quit and reopen Claude to see them."));
+                                let text = if ctx.config().chinese() {
+                                    format!("已把其他组织的 {n} 个会话复制进 Claude 当前打开的组织。退出并重新打开 Claude 就能看到。")
+                                } else {
+                                    format!("Copied {n} session(s) from your other accounts into the one Claude has open. Quit and reopen Claude to see them.")
+                                };
+                                notify(ctx, &text);
                                 st.notified.push(key.clone());
                                 let _ = st.save(&ctx.paths);
                             }
                         }
                     }
-                    Err(e) => ctx.log(format!("watch: {e:#}")),
+                    Err(e) => {
+                        ctx.log(format!("watch: {e:#}"));
+                        sync_failed(ctx, &format!("{e:#}"));
+                    }
                 }
                 // Remember what this pass started from, not what it left: a change made while it
                 // ran must trigger the next pass. Our own writes do too, and that pass finds nothing.
