@@ -124,6 +124,7 @@ pub fn run(ctx: &Ctx, opts: &WatchOptions, stop: &AtomicBool) {
     let mut last_full: Option<Instant> = None;
     let mut last_running: Option<bool> = None;
     let mut passes = 0u64;
+    let mut paused_logged = false;
     // The heartbeat has a thread of its own, from the start: a long first sync must not make a
     // working agent look dead to the app.
     let done = AtomicBool::new(false);
@@ -165,6 +166,21 @@ pub fn run(ctx: &Ctx, opts: &WatchOptions, stop: &AtomicBool) {
                         fp = next;
                     }
                 }
+                if ctx.config().paused {
+                    if !paused_logged {
+                        ctx.log("syncing is paused; `cc-same resume` turns it back on");
+                        paused_logged = true;
+                    }
+                    last_fp = Some(fp);
+                    last_full = Some(Instant::now());
+                    last_running = Some(running);
+                    if opts.iterations.is_some_and(|max| passes >= max) {
+                        break;
+                    }
+                    sleep_while(stop, opts.interval);
+                    continue;
+                }
+                paused_logged = false;
                 let state = State::load(&ctx.paths);
                 let app = desktop::detect(ctx);
                 ensure_active_partition(ctx, &app, &state);

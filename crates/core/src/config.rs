@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(deserialize_with = "de_number")]
     pub switch_grace_seconds: f64,
     pub notify: bool,
+    /// Syncing is paused (after an undo, or `cc-same pause`) until `cc-same resume`.
+    pub paused: bool,
     /// Desktop app: `system`, `light` or `dark`.
     pub appearance: String,
     /// Desktop app: `system` or a language code such as `zh-CN`.
@@ -60,6 +62,7 @@ impl Default for Config {
             trash_days: 30.0,
             switch_grace_seconds: 30.0,
             notify: true,
+            paused: false,
             appearance: "system".into(),
             language: "system".into(),
             tray: true,

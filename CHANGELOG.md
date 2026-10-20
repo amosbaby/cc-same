@@ -20,6 +20,15 @@ Settings › Updates.
   (`cc-same config --language zh-CN`), `CC_SAME_LANG=zh`, or the system locale is Chinese; the
   setup script sets it.
 
+### Added
+
+- `cc-same undo`: undo the last sync (or one from `undo --list`) file by file. Before a sync
+  changes a file it keeps a copy-on-write clone of the old one; undo puts each file back, moves
+  what the sync created to the trash, and leaves alone any file that changed again since. Syncing
+  is then paused, since the other orgs would bring it all back: `cc-same resume` turns it on
+  again, `cc-same pause` pauses by hand. The last 50 syncs are kept, none older than `trashDays`.
+- `--dry-run` for `sync`, `install`, `restore` and `undo`.
+
 ### Fixed
 
 - `status` reported 0 changes after a sync that made some: the last, empty round of a run

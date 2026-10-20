@@ -148,6 +148,7 @@ cat <<EOF
 
 重新打开 Claude，照常在 Claude 里切换组织即可，后台会保持两边的会话列表一致。
   查看状态：cc-same doctor        cc-same orgs
+  撤销：    cc-same undo --dry-run   cc-same undo   （撤销最近一次同步；先退出 Claude）
   快照：    cc-same snapshots     cc-same restore <id>   （先退出 Claude）
   改名字：  cc-same config --name <账号>/<组织>=<名字>
   停止同步：cc-same uninstall     （每个组织都保留完整副本）

@@ -388,7 +388,7 @@ fn additive_write_never_clobbers_a_file_that_appeared() {
     let mut state = State::load(&ctx.paths);
     let (plan, _, _) = build_plan(&ctx, None, Some(&state));
     e.record(B, &x, 150_000, json!({"title": "Desktop wrote this meanwhile"}));
-    apply_plan(&ctx, plan, &mut state, "test").unwrap();
+    apply_plan(&ctx, plan, &mut state, "test", &mut cc_same_core::journal::Recorder::new(&ctx, "test")).unwrap();
     assert_eq!(e.read(B, &x)["title"], "Desktop wrote this meanwhile");
 }
 
@@ -531,7 +531,8 @@ fn collection_write_skipped_at_apply_keeps_the_old_base() {
     let (plan, _, _) = build_plan(&planner, None, Some(&state));
     // Claude loads B between planning and applying: the write to B must be skipped
     let loaded_b = e.ctx_with(true, Some(vec![key(B)]));
-    apply_plan(&loaded_b, plan, &mut state, "test").unwrap();
+    apply_plan(&loaded_b, plan, &mut state, "test", &mut cc_same_core::journal::Recorder::new(&loaded_b, "test"))
+        .unwrap();
     assert_eq!(e.task_ids(B), ["t1", "t2"]);
     e.sync(); // Claude quit: B must now lose t2, not resurrect it in A
     assert_eq!(e.task_ids(A), ["t1"]);
@@ -786,4 +787,78 @@ fn the_last_sync_counts_every_round() {
     assert!(out.applied_total() > 0);
     let last = State::load(&e.paths()).last_sync.unwrap();
     assert_eq!(last.applied, out.applied_total() as u64);
+}
+
+mod undo {
+    use super::*;
+    use cc_same_core::journal;
+
+    fn local(e: &Env, p: (&str, &str), u: &str) -> PathBuf {
+        e.code(p).join(format!("local_{u}.json"))
+    }
+
+    #[test]
+    fn undo_puts_every_file_back_and_pauses_syncing() {
+        let e = Env::new();
+        let (x, y) = (uid(), uid());
+        e.record(A, &x, 100_000, json!({"title": "x in A"}));
+        e.record(B, &y, 100_000, json!({"title": "y old"}));
+        e.record(A, &y, 200_000, json!({"title": "y new"}));
+        e.sync();
+        assert_eq!(e.read(B, &x)["title"], "x in A");
+        assert_eq!(e.read(B, &y)["title"], "y new");
+
+        // A dry run changes nothing.
+        let ctx = e.ctx();
+        let preview = journal::undo(&ctx, None, true).unwrap();
+        assert!(preview.removed.iter().any(|p| p.ends_with(&format!("local_{x}.json"))));
+        assert!(preview.restored.iter().any(|p| p.ends_with(&format!("local_{y}.json"))));
+        assert_eq!(e.read(B, &y)["title"], "y new");
+        assert!(!ctx.config().paused);
+
+        let done = journal::undo(&ctx, None, false).unwrap();
+        assert_eq!(done, preview);
+        assert!(!local(&e, B, &x).exists(), "the copy the sync made is gone");
+        assert_eq!(e.read(B, &y)["title"], "y old", "the overwritten session is back");
+        assert_eq!(e.read(A, &x)["title"], "x in A", "the source is untouched");
+        assert!(Config::load(&e.paths()).unwrap().paused);
+        assert!(run_sync(&e.ctx(), "test").is_err(), "paused until resumed");
+        assert!(journal::undo(&e.ctx(), None, false).is_err(), "nothing left to undo");
+    }
+
+    #[test]
+    fn undo_leaves_a_file_that_changed_again() {
+        let e = Env::new();
+        let x = uid();
+        e.record(A, &x, 100_000, json!({"title": "x"}));
+        e.code(B);
+        e.sync();
+        e.record(B, &x, 300_000, json!({"title": "edited in B after the sync"}));
+        let done = journal::undo(&e.ctx(), None, false).unwrap();
+        assert_eq!(done.skipped.len(), 1);
+        assert_eq!(e.read(B, &x)["title"], "edited in B after the sync");
+    }
+
+    #[test]
+    fn undo_waits_for_claude_to_quit() {
+        let e = Env::new();
+        let x = uid();
+        e.record(A, &x, 100_000, json!({}));
+        e.code(B);
+        e.sync();
+        assert!(journal::undo(&e.ctx_with(true, Some(vec![])), None, false).is_err());
+        assert!(journal::undo(&e.ctx_with(true, Some(vec![])), None, true).is_ok(), "a dry run is fine");
+        assert!(local(&e, B, &x).exists());
+    }
+
+    #[test]
+    fn a_sync_with_nothing_to_do_leaves_no_journal() {
+        let e = Env::new();
+        e.record(A, &uid(), 100_000, json!({}));
+        e.code(B);
+        e.sync();
+        let before = journal::list(&e.ctx()).len();
+        e.sync();
+        assert_eq!(journal::list(&e.ctx()).len(), before);
+    }
 }

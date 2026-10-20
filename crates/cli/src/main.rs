@@ -56,6 +56,9 @@ enum Cmd {
     Sync {
         #[arg(short, long)]
         yes: bool,
+        /// Only show what would change (same as `plan`)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Keep syncing (the background agent runs this)
     Watch {
@@ -72,6 +75,9 @@ enum Cmd {
     Install {
         #[arg(short, long)]
         yes: bool,
+        /// Only show what the first sync would change and what would be installed
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Stop background syncing (every account keeps its full copy)
     Uninstall,
@@ -84,7 +90,27 @@ enum Cmd {
         snapshot: String,
         #[arg(short, long)]
         yes: bool,
+        /// Only show what would change
+        #[arg(long)]
+        dry_run: bool,
     },
+    /// Undo the last sync (or the one named), file by file; then syncing is paused (quit Claude first)
+    Undo {
+        /// Which sync (default: the newest one not undone yet; `--list` shows them)
+        run: Option<String>,
+        #[arg(short, long)]
+        yes: bool,
+        /// Only show what would change
+        #[arg(long)]
+        dry_run: bool,
+        /// List the syncs that can be undone
+        #[arg(long, conflicts_with_all = ["run", "dry_run", "yes"])]
+        list: bool,
+    },
+    /// Pause syncing (the background agent stays installed and waits)
+    Pause,
+    /// Turn syncing back on after `pause` or `undo`
+    Resume,
     /// Turn symlinked index folders left by other tools into real folders (quit Claude first)
     FixSymlinks {
         #[arg(short, long)]
@@ -238,7 +264,12 @@ fn run(cli: Cli) -> Result<()> {
     match cmd {
         Cmd::Doctor => doctor(&ctx),
         Cmd::Plan => show_plan(&ctx, cli.verbose),
-        Cmd::Sync { yes } => sync(&ctx, yes),
+        Cmd::Sync { yes, dry_run } => {
+            if dry_run {
+                return show_plan(&ctx, cli.verbose);
+            }
+            sync(&ctx, yes)
+        }
         Cmd::Watch { interval, iterations, foreground } => {
             if !foreground {
                 ctx.logger.set_sink(LogSink::File(ctx.paths.log_file.clone()));
@@ -247,7 +278,7 @@ fn run(cli: Cli) -> Result<()> {
             watch::run(&ctx, &opts, &AtomicBool::new(false));
             Ok(())
         }
-        Cmd::Install { yes } => install(&ctx, yes),
+        Cmd::Install { yes, dry_run } => install(&ctx, yes, dry_run),
         Cmd::Uninstall => {
             service::uninstall(&ctx)?;
             println!("Background sync removed. Every account keeps its full copy of your sessions.");
@@ -256,21 +287,57 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Status => status(&ctx),
         Cmd::Snapshots => snapshots(&ctx),
-        Cmd::Restore { snapshot, yes } => {
+        Cmd::Restore { snapshot, yes, dry_run } => {
             let manifest = snapshot::list(&ctx).into_iter().find(|m| m.id == snapshot);
-            let Some(m) = manifest else { bail!("no such snapshot: {snapshot} (see `cc-same snapshots`)") };
-            println!(
-                "Restore {} session folder(s) from {}. The current ones go to the trash first.",
-                m.partitions.len(),
-                m.id
-            );
-            if !yes && !confirm("Continue?") {
+            let Some(m) = manifest else {
+                if zh() {
+                    bail!("没有这个快照：{snapshot}（用 `cc-same snapshots` 查看）");
+                }
+                bail!("no such snapshot: {snapshot} (see `cc-same snapshots`)")
+            };
+            if zh() {
+                println!("从 {} 恢复 {} 个会话文件夹。当前的文件夹会先放进回收站。", m.id, m.partitions.len());
+            } else {
+                println!(
+                    "Restore {} session folder(s) from {}. The current ones go to the trash first.",
+                    m.partitions.len(),
+                    m.id
+                );
+            }
+            let names = with_names(&ctx, scan::account_labels(&ctx));
+            for part in &m.partitions {
+                let key = format!("{}/{}", part.acct, part.org);
+                let Some(surface) = Surface::parse(&part.surface) else { continue };
+                let now = count_sessions(&ctx.paths.surface_root(surface).join(&part.acct).join(&part.org));
+                let then = count_sessions(
+                    &ctx.paths.snapshots_dir().join(&m.id).join(&part.surface).join(&part.acct).join(&part.org),
+                );
+                let who =
+                    names.get(&key).cloned().unwrap_or_else(|| format!("{}/{}", short(&part.acct), short(&part.org)));
+                if zh() {
+                    println!("  {who}：现在 {now} 个会话 → 恢复后 {then} 个");
+                } else {
+                    println!("  {who}: {now} sessions now -> {then} after the restore");
+                }
+            }
+            if dry_run {
+                println!("{}", tr("Dry run: nothing was changed.", "仅预览：没有做任何改动。"));
+                return Ok(());
+            }
+            if !yes && !confirm(tr("Continue?", "继续吗？")) {
                 return Ok(());
             }
             let pre = snapshot::restore(&ctx, &m.id)?;
-            println!("Restored. The state before this restore is snapshot {pre}.");
+            if zh() {
+                println!("已恢复。恢复之前的状态保存在快照 {pre}。");
+            } else {
+                println!("Restored. The state before this restore is snapshot {pre}.");
+            }
             Ok(())
         }
+        Cmd::Undo { run, yes, dry_run, list } => undo(&ctx, run.as_deref(), yes, dry_run, list),
+        Cmd::Pause => set_paused(&ctx, true),
+        Cmd::Resume => set_paused(&ctx, false),
         Cmd::FixSymlinks { yes } => {
             let todo = snapshot::symlinked_folders(&ctx);
             if todo.is_empty() {
@@ -555,6 +622,131 @@ fn reason_text(reason: &str) -> &str {
     }
 }
 
+fn count_sessions(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with("local_") && n.ends_with(".json")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A path from an undo journal, as `<org name>: <file>`.
+fn journal_path(names: &BTreeMap<String, String>, rel: &str) -> String {
+    let parts: Vec<&str> = rel.split('/').collect();
+    match parts.as_slice() {
+        [_, acct, org, rest @ ..] if !rest.is_empty() => {
+            let key = format!("{acct}/{org}");
+            let who = names.get(&key).cloned().unwrap_or_else(|| format!("{}/{}", short(acct), short(org)));
+            format!("{who}{}{}", tr(": ", "："), rest.join("/"))
+        }
+        _ => rel.to_string(),
+    }
+}
+
+fn undo(ctx: &Ctx, run: Option<&str>, yes: bool, dry_run: bool, list: bool) -> Result<()> {
+    use cc_same_core::journal;
+    if list {
+        let runs = journal::list(ctx);
+        if runs.is_empty() {
+            println!("{}", tr("No syncs to undo yet.", "还没有可以撤销的同步。"));
+        }
+        for j in runs.iter().rev() {
+            let undone = match (j.undone_at, zh()) {
+                (Some(_), true) => "  （已撤销）",
+                (Some(_), false) => "  (undone)",
+                (None, _) => "",
+            };
+            if zh() {
+                println!(
+                    "{}  {}，{}，{} 个文件{undone}",
+                    j.id,
+                    ago(j.created),
+                    reason_text(&j.reason),
+                    j.entries.len()
+                );
+            } else {
+                println!("{}  {}, {}, {} file(s){undone}", j.id, ago(j.created), j.reason, j.entries.len());
+            }
+        }
+        return Ok(());
+    }
+    let names = with_names(ctx, scan::account_labels(ctx));
+    let preview = journal::undo(ctx, run, true)?;
+    let show = |label: &str, items: &[String]| {
+        if !items.is_empty() {
+            println!("{label}");
+            for p in items {
+                println!("  {}", journal_path(&names, p));
+            }
+        }
+    };
+    if zh() {
+        println!("撤销同步 {}：", preview.id);
+        show(&format!("恢复成同步前的样子（{} 个）：", preview.restored.len()), &preview.restored);
+        show(&format!("移进回收站，这些是那次同步新建的（{} 个）：", preview.removed.len()), &preview.removed);
+        show(&format!("跳过，同步之后又改过（{} 个）：", preview.skipped.len()), &preview.skipped);
+    } else {
+        println!("Undo sync {}:", preview.id);
+        show(&format!("Put back as before the sync ({}):", preview.restored.len()), &preview.restored);
+        show(&format!("Moved to the trash, created by that sync ({}):", preview.removed.len()), &preview.removed);
+        show(&format!("Skipped, changed again since ({}):", preview.skipped.len()), &preview.skipped);
+    }
+    println!(
+        "{}",
+        tr(
+            "Afterwards syncing is paused: the other orgs still have what that sync copied, so syncing again would redo it. Change the setup first (e.g. `cc-same config --only ...`), then `cc-same resume`.",
+            "撤销后同步会暂停：其他组织里仍有那次同步复制的内容，直接恢复同步会把同样的改动再做一遍。请先调整配置（比如 `cc-same config --only ...`），再运行 `cc-same resume`。"
+        )
+    );
+    if dry_run {
+        println!("{}", tr("Dry run: nothing was changed.", "仅预览：没有做任何改动。"));
+        return Ok(());
+    }
+    if !yes && !confirm(tr("Undo it?", "确定撤销吗？")) {
+        return Ok(());
+    }
+    let done = journal::undo(ctx, Some(&preview.id), false)?;
+    if zh() {
+        println!(
+            "已撤销：恢复 {} 个，移进回收站 {} 个，跳过 {} 个。同步已暂停。",
+            done.restored.len(),
+            done.removed.len(),
+            done.skipped.len()
+        );
+    } else {
+        println!(
+            "Undone: {} put back, {} moved to the trash, {} skipped. Syncing is paused.",
+            done.restored.len(),
+            done.removed.len(),
+            done.skipped.len()
+        );
+    }
+    Ok(())
+}
+
+fn set_paused(ctx: &Ctx, paused: bool) -> Result<()> {
+    let mut cfg = ctx.config();
+    if cfg.paused != paused {
+        cfg.paused = paused;
+        cfg.save(&ctx.paths)?;
+    }
+    println!(
+        "{}",
+        match (paused, zh()) {
+            (true, false) => "Syncing is paused. `cc-same resume` turns it back on.",
+            (true, true) => "同步已暂停。用 `cc-same resume` 恢复。",
+            (false, false) => "Syncing is on.",
+            (false, true) => "同步已恢复。",
+        }
+    );
+    Ok(())
+}
+
 fn confirm(prompt: &str) -> bool {
     if !std::io::stdin().is_terminal() {
         println!(
@@ -653,6 +845,12 @@ fn doctor(ctx: &Ctx) -> Result<()> {
     });
     println!("{desktop}{}", open.unwrap_or_default());
     println!("{}{}", tr("Background sync: ", "后台同步："), service_line(&ov));
+    if ctx.config().paused {
+        println!(
+            "{}",
+            tr("Syncing is paused (`cc-same resume` turns it back on)", "同步已暂停（用 `cc-same resume` 恢复）")
+        );
+    }
     for sv in &ov.surfaces {
         println!();
         if zh() {
@@ -873,7 +1071,19 @@ fn show_plan(ctx: &Ctx, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// Stop before a sync while syncing is paused.
+fn refuse_paused(ctx: &Ctx) -> Result<()> {
+    if ctx.config().paused {
+        bail!(
+            "{}",
+            tr("syncing is paused (`cc-same resume` turns it back on)", "同步已暂停（用 `cc-same resume` 恢复）")
+        );
+    }
+    Ok(())
+}
+
 fn sync(ctx: &Ctx, yes: bool) -> Result<()> {
+    refuse_paused(ctx)?;
     let (plan, _, _) = plan::build_plan(ctx, None, None);
     let labels = with_names(ctx, cc_same_core::scan::account_labels(ctx));
     for l in describe_plan(&report::summarize(&plan), &labels) {
@@ -913,12 +1123,30 @@ fn sync(ctx: &Ctx, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn install(ctx: &Ctx, yes: bool) -> Result<()> {
+fn install(ctx: &Ctx, yes: bool, dry_run: bool) -> Result<()> {
+    if !dry_run {
+        refuse_paused(ctx)?;
+    }
     let (plan, _, _) = plan::build_plan(ctx, None, None);
     let labels = with_names(ctx, cc_same_core::scan::account_labels(ctx));
     println!("{}", tr("First sync:", "首次同步："));
     for l in describe_plan(&report::summarize(&plan), &labels) {
         println!("{l}");
+    }
+    if dry_run {
+        let agent = ctx.paths.bin_dir().join(if cfg!(windows) { "cc-same-agent.exe" } else { "cc-same" });
+        if zh() {
+            println!("会安装后台同步：{}，登录时自动启动，日志写到 {}", agent.display(), ctx.paths.log_file.display());
+            println!("仅预览：没有做任何改动。");
+        } else {
+            println!(
+                "Would install the background agent {} (starts at login, logs to {})",
+                agent.display(),
+                ctx.paths.log_file.display()
+            );
+            println!("Dry run: nothing was changed.");
+        }
+        return Ok(());
     }
     if !yes && !confirm(tr("Sync now and keep syncing in the background?", "现在同步，并在后台持续同步吗？"))
     {
@@ -1239,6 +1467,9 @@ fn status(ctx: &Ctx) -> Result<()> {
     };
     if zh() {
         println!("后台同步：{}，{}", if st.installed { "已开启" } else { "已关闭" }, service_detail(&st.detail));
+        if ctx.config().paused {
+            println!("同步已暂停（用 `cc-same resume` 恢复）");
+        }
         if let Some(h) = &beat {
             println!("后台进程：v{}（pid {}），上次检查：{}", h.version, h.pid, ago(h.heartbeat_at));
         }
@@ -1261,6 +1492,9 @@ fn status(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     println!("Background sync: {}{}", if st.installed { "on, " } else { "off, " }, st.detail);
+    if ctx.config().paused {
+        println!("Syncing is paused (`cc-same resume` turns it back on)");
+    }
     if let Some(h) = &beat {
         println!("Agent: v{} (pid {}), last check {}", h.version, h.pid, ago(h.heartbeat_at));
     }

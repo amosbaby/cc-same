@@ -4,6 +4,7 @@ use crate::config::{LastSync, State};
 use crate::ctx::Ctx;
 use crate::desktop;
 use crate::fsx;
+use crate::journal::Recorder;
 use crate::model::*;
 use crate::plan::build_plan;
 use crate::snapshot;
@@ -184,7 +185,7 @@ fn execute(ctx: &Ctx, a: &Action, stamp: &str) -> Result<bool> {
 }
 
 /// Apply `plan`, then record bookkeeping in `state` and save it.
-pub fn apply_plan(ctx: &Ctx, mut plan: Plan, state: &mut State, reason: &str) -> Result<Outcome> {
+pub fn apply_plan(ctx: &Ctx, mut plan: Plan, state: &mut State, reason: &str, rec: &mut Recorder) -> Result<Outcome> {
     let cfg = ctx.config();
     let mut out = Outcome { deferred: plan.deferred_total(), ..Outcome::default() };
     if !plan.actions.is_empty() {
@@ -213,7 +214,18 @@ pub fn apply_plan(ctx: &Ctx, mut plan: Plan, state: &mut State, reason: &str) ->
             if fresh.loaded(&a.part) && !(a.additive && first_join) {
                 out.skipped_loaded += 1;
             } else {
-                match execute(ctx, a, &stamp) {
+                let target = a.part.path.join(&a.name);
+                let result = rec.before(&target).and_then(|before| match execute(ctx, a, &stamp) {
+                    Ok(true) => {
+                        rec.changed(&target, before);
+                        Ok(true)
+                    }
+                    other => {
+                        rec.unchanged(before);
+                        other
+                    }
+                });
+                match result {
                     Ok(true) => {
                         done = true;
                         *out.applied.entry(a.kind).or_default() += 1;
@@ -272,7 +284,11 @@ pub fn apply_plan(ctx: &Ctx, mut plan: Plan, state: &mut State, reason: &str) ->
 pub fn run_sync(ctx: &Ctx, reason: &str) -> Result<(Plan, Outcome)> {
     // A typo in `exclude` must not quietly sync an account that was meant to stay out.
     ctx.config().check()?;
+    if ctx.config().paused {
+        bail!("syncing is paused (`cc-same resume` turns it back on)");
+    }
     let _lock = Lock::acquire(ctx, Duration::from_secs(30))?;
+    let mut rec = Recorder::new(ctx, reason);
     clear_stale_restart_hint(ctx)?;
     let mut total = Outcome::default();
     let mut last = Plan::default();
@@ -281,12 +297,15 @@ pub fn run_sync(ctx: &Ctx, reason: &str) -> Result<(Plan, Outcome)> {
         let (plan, _, _) = build_plan(ctx, None, Some(&state));
         let had_actions = !plan.actions.is_empty();
         last = plan.clone();
-        let outcome = apply_plan(ctx, plan, &mut state, reason)?;
+        let outcome = apply_plan(ctx, plan, &mut state, reason, &mut rec)?;
         let failed = !outcome.errors.is_empty();
         total.absorb(outcome);
         if !had_actions || failed {
             break;
         }
+    }
+    if let Some(id) = rec.finish(ctx)? {
+        ctx.debug(format!("undo journal: {id}"));
     }
     // Each round records itself, and the last one usually has nothing left to do: record the run.
     if total.applied_total() > 0 || !total.errors.is_empty() {
