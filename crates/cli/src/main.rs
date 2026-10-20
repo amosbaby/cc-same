@@ -153,8 +153,12 @@ enum Cmd {
     Move { account: String, number: u32 },
     /// Every account/org folder on this computer, with full ids
     Orgs {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tsv")]
         json: bool,
+        /// One tab-separated line per org: id, name, email, sessions, syncs, open, recent titles
+        /// (`-` for an empty field)
+        #[arg(long)]
+        tsv: bool,
     },
     /// Show or change settings
     Config {
@@ -171,6 +175,12 @@ enum Cmd {
         /// Empty the --only list (every account not excluded takes part again)
         #[arg(long)]
         clear_only: bool,
+        /// Name an org so lists show it: `<account>/<org>=<name>` (a unique prefix is enough)
+        #[arg(long, value_name = "ID=NAME")]
+        name: Vec<String>,
+        /// Take a name away
+        #[arg(long, value_name = "ID")]
+        unname: Vec<String>,
         /// Let accounts that appear later join automatically
         #[arg(long)]
         auto_join: Option<OnOff>,
@@ -286,8 +296,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Enable { account } => sit_out(&ctx, &account, false),
         #[cfg(feature = "account-switching")]
         Cmd::Move { account, number } => move_account(&ctx, &account, number),
-        Cmd::Orgs { json } => orgs(&ctx, json),
-        Cmd::Config { exclude, include, only, clear_only, auto_join, notify } => {
+        Cmd::Orgs { json, tsv } => orgs(&ctx, json, tsv),
+        Cmd::Config { exclude, include, only, clear_only, name, unname, auto_join, notify } => {
             let mut cfg = ctx.config();
             let before = cfg.clone();
             let known = known_pairs(&ctx);
@@ -307,6 +317,18 @@ fn run(cli: Cli) -> Result<()> {
                 if !cfg.only.contains(&id) {
                     cfg.only.push(id);
                 }
+            }
+            for pair in name {
+                let Some((id, label)) = pair.split_once('=') else { bail!("--name takes <account>/<org>=<name>") };
+                let label = label.trim();
+                anyhow::ensure!(!label.is_empty() && !label.contains(['\t', '\n', '\r']), "--name: empty or odd name");
+                let id = resolve(id, &known)?;
+                anyhow::ensure!(id.contains('/'), "--name takes <account>/<org>, not an account alone: {id}");
+                cfg.names.insert(id, label.to_string());
+            }
+            for id in unname {
+                let id = resolve(&id, &known)?;
+                cfg.names.remove(&id);
             }
             if let Some(v) = auto_join {
                 cfg.auto_join_new = matches!(v, OnOff::On);
@@ -351,28 +373,51 @@ fn resolve(input: &str, known: &[(String, String)]) -> Result<String> {
     Ok(id)
 }
 
-fn orgs(ctx: &Ctx, json: bool) -> Result<()> {
+fn orgs(ctx: &Ctx, json: bool, tsv: bool) -> Result<()> {
     let cfg = ctx.config();
     let labels = scan::account_labels(ctx);
+    let org_labels = scan::org_labels(ctx);
     let app = desktop::detect(ctx);
+    let parts = scan::discover(ctx, Surface::Code);
     let mut rows = Vec::new();
     for (acct, org) in known_pairs(ctx) {
-        let part = scan::discover(ctx, Surface::Code).into_iter().find(|p| p.acct == acct && p.org == org);
-        let sessions = part.as_ref().map(|p| scan::scan_partition(ctx, p).live_sessions());
+        let id = format!("{acct}/{org}");
+        let scanned = parts.iter().find(|p| p.acct == acct && p.org == org).map(|p| scan::scan_partition(ctx, p));
         let open =
             app.open_account.as_deref() == Some(acct.as_str()) && app.open_org.as_deref().is_none_or(|o| o == org);
         rows.push(serde_json::json!({
-            "id": format!("{acct}/{org}"),
+            "id": id,
             "account": acct,
             "org": org,
+            "name": cfg.names.get(&id).or(org_labels.get(&id)),
             "email": labels.get(&acct),
-            "sessions": sessions,
+            "sessions": scanned.as_ref().map(|s| s.live_sessions()),
+            "recent": scanned.as_ref().map(|s| scan::recent_titles(s, 3)).unwrap_or_default(),
             "open": open && app.running,
             "syncs": !cfg.is_excluded(&acct, &org),
         }));
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().replace(['\t', '\n', '\r'], " ");
+    if tsv {
+        // Empty fields read as `-`: a shell splitting on tabs would merge two in a row.
+        let or_dash = |s: String| if s.trim().is_empty() { "-".to_string() } else { s };
+        for r in &rows {
+            let recent: Vec<String> = r["recent"].as_array().into_iter().flatten().map(text).collect();
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                text(&r["id"]),
+                or_dash(text(&r["name"])),
+                or_dash(text(&r["email"])),
+                or_dash(r["sessions"].as_u64().map(|n| n.to_string()).unwrap_or_default()),
+                if r["syncs"] == true { "1" } else { "0" },
+                if r["open"] == true { "1" } else { "0" },
+                or_dash(recent.join(" | ")),
+            );
+        }
         return Ok(());
     }
     if rows.is_empty() {
@@ -382,13 +427,18 @@ fn orgs(ctx: &Ctx, json: bool) -> Result<()> {
         let sessions =
             r["sessions"].as_u64().map(|n| format!("{n} sessions")).unwrap_or_else(|| "no folder yet".into());
         println!(
-            "{}  {:<30} {:<14} {}{}",
-            r["id"].as_str().unwrap_or_default(),
+            "{}  {:<16} {:<30} {:<14} {}{}",
+            text(&r["id"]),
+            r["name"].as_str().unwrap_or("-"),
             r["email"].as_str().unwrap_or("-"),
             sessions,
             if r["syncs"] == true { "syncs" } else { "separate" },
             if r["open"] == true { "  OPEN IN CLAUDE" } else { "" },
         );
+        let recent: Vec<String> = r["recent"].as_array().into_iter().flatten().map(text).collect();
+        if !recent.is_empty() {
+            println!("      recent: {}", recent.join(" | "));
+        }
     }
     Ok(())
 }
@@ -408,13 +458,24 @@ fn email_or_id(ov: &Overview, acct: &str) -> String {
     ov.labels.get(acct).cloned().unwrap_or_else(|| format!("account {}", short(acct)))
 }
 
+/// Account emails plus org names (`<account>/<org>` keys), so two orgs of one account can be
+/// told apart.
+fn with_names(ctx: &Ctx, mut labels: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let names = ctx.config().names;
+    for (id, name) in scan::org_labels(ctx).into_iter().chain(names) {
+        let email = id.split('/').next().and_then(|a| labels.get(a)).cloned();
+        labels.insert(id, email.map(|e| format!("{name} ({e})")).unwrap_or(name));
+    }
+    labels
+}
+
 fn describe_plan(ov_plan: &report::PlanView, labels: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     let mut lines = Vec::new();
     if ov_plan.total == 0 {
         lines.push("Nothing to do: every linked account already has the same sessions.".to_string());
     }
     for (p, kinds) in &ov_plan.per_partition {
-        let who = labels.get(&p.acct).cloned().unwrap_or_else(|| p.label());
+        let who = labels.get(&p.key()).or(labels.get(&p.acct)).cloned().unwrap_or_else(|| p.label());
         let what: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
         lines.push(format!("  {:<6} {:<32} {}", p.surface.as_str(), who, what.join(", ")));
     }
@@ -422,7 +483,7 @@ fn describe_plan(ov_plan: &report::PlanView, labels: &std::collections::BTreeMap
         lines.push("Waiting for Claude (it has these open; applied after you switch accounts or quit):".into());
         for (key, n) in &ov_plan.deferred {
             let acct = key.split('/').next().unwrap_or(key);
-            let who = labels.get(acct).cloned().unwrap_or_else(|| short(acct).to_string());
+            let who = labels.get(key).or(labels.get(acct)).cloned().unwrap_or_else(|| short(acct).to_string());
             lines.push(format!("  {who}: {n} change(s)"));
         }
     }
@@ -444,6 +505,7 @@ fn doctor(ctx: &Ctx) -> Result<()> {
     let open = ov.app.open_account.as_deref().map(|a| format!("; open account: {}", email_or_id(&ov, a)));
     println!("{desktop}{}", open.unwrap_or_default());
     println!("Background sync: {}", service_line(&ov));
+    let names = with_names(ctx, ov.labels.clone());
     for sv in &ov.surfaces {
         println!();
         println!("{} sessions ({})", sv.surface.title(), sv.surface.dir_name());
@@ -458,7 +520,7 @@ fn doctor(ctx: &Ctx) -> Result<()> {
             if pv.part.is_link {
                 flags.push("SYMLINK");
             }
-            let who = pv.email.clone().unwrap_or_default();
+            let who = names.get(&pv.part.key()).or(pv.email.as_ref()).cloned().unwrap_or_default();
             if let Some(err) = &pv.error {
                 println!("  {}  {:<30} {}  {err}", pv.part.label(), who, flags.join(" "));
                 continue;
@@ -501,7 +563,7 @@ fn doctor(ctx: &Ctx) -> Result<()> {
     }
     println!("\nNot synced by design: sidebar groups and order (a server setting of each account), pins, Cowork tasks, claude.ai chats, projects and memory, cloud sessions, connectors and Remote Control links.");
     println!("\nIf you sync now:");
-    for l in describe_plan(&ov.plan, &ov.labels) {
+    for l in describe_plan(&ov.plan, &with_names(ctx, ov.labels.clone())) {
         println!("{l}");
     }
     Ok(())
@@ -556,7 +618,7 @@ fn show_plan(ctx: &Ctx, verbose: bool) -> Result<()> {
     if app.running {
         println!("Claude is running; changes to the account it has open wait until you switch accounts or quit.");
     }
-    let labels = cc_same_core::scan::account_labels(ctx);
+    let labels = with_names(ctx, cc_same_core::scan::account_labels(ctx));
     for l in describe_plan(&report::summarize(&plan), &labels) {
         println!("{l}");
     }
@@ -571,7 +633,7 @@ fn show_plan(ctx: &Ctx, verbose: bool) -> Result<()> {
 
 fn sync(ctx: &Ctx, yes: bool) -> Result<()> {
     let (plan, _, _) = plan::build_plan(ctx, None, None);
-    let labels = cc_same_core::scan::account_labels(ctx);
+    let labels = with_names(ctx, cc_same_core::scan::account_labels(ctx));
     for l in describe_plan(&report::summarize(&plan), &labels) {
         println!("{l}");
     }
@@ -599,7 +661,7 @@ fn sync(ctx: &Ctx, yes: bool) -> Result<()> {
 
 fn install(ctx: &Ctx, yes: bool) -> Result<()> {
     let (plan, _, _) = plan::build_plan(ctx, None, None);
-    let labels = cc_same_core::scan::account_labels(ctx);
+    let labels = with_names(ctx, cc_same_core::scan::account_labels(ctx));
     println!("First sync:");
     for l in describe_plan(&report::summarize(&plan), &labels) {
         println!("{l}");

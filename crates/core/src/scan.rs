@@ -246,6 +246,35 @@ pub fn transcript_index(ctx: &Ctx) -> Option<Arc<HashSet<String>>> {
     result
 }
 
+/// Organization names Claude Code's CLI login knows: `<account>/<org>` -> name. Only the org
+/// the CLI is signed in to; Desktop keeps no names locally.
+pub fn org_labels(ctx: &Ctx) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    if let Ok(Value::Object(root)) = fsx::read_json(&ctx.paths.claude_json, 64 * 1024 * 1024) {
+        if let Some(Value::Object(oa)) = root.get("oauthAccount") {
+            if let (Some(Value::String(acct)), Some(Value::String(org)), Some(Value::String(name))) =
+                (oa.get("accountUuid"), oa.get("organizationUuid"), oa.get("organizationName"))
+            {
+                if is_uuid(acct) && is_uuid(org) && !name.trim().is_empty() {
+                    labels.insert(format!("{acct}/{org}"), name.trim().to_string());
+                }
+            }
+        }
+    }
+    labels
+}
+
+/// Titles of the most recently changed sessions in a partition, newest first.
+pub fn recent_titles(ps: &PartState, n: usize) -> Vec<String> {
+    let mut recs: Vec<&Record> = ps.records.values().filter(|r| r.data.is_some()).collect();
+    recs.sort_by_key(|r| std::cmp::Reverse(r.mtime_ns));
+    recs.iter()
+        .filter_map(|r| r.data.as_ref()?.get("title")?.as_str().map(str::to_string))
+        .filter(|t| !t.trim().is_empty())
+        .take(n)
+        .collect()
+}
+
 /// Best-effort email per account id, from Claude Code's CLI login and local Cowork records.
 pub fn account_labels(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();

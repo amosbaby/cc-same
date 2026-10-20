@@ -19,6 +19,8 @@ pub struct Config {
     /// When not empty, only these `<account>` or `<account>/<org>` entries take part; every
     /// other account and org stays separate, including ones that appear later.
     pub only: Vec<String>,
+    /// Names people gave their orgs, by full `<account>/<org>` id (Desktop keeps none locally).
+    pub names: BTreeMap<String, String>,
     /// Accounts and orgs that appear later join automatically.
     pub auto_join_new: bool,
     /// Rolling snapshots kept (the baseline is kept forever).
@@ -50,6 +52,7 @@ impl Default for Config {
         Config {
             exclude: Vec::new(),
             only: Vec::new(),
+            names: BTreeMap::new(),
             // Off: an account signed in to later (a personal one, say) must be added on purpose.
             auto_join_new: false,
             keep_snapshots: 20,

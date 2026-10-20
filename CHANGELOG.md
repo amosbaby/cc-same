@@ -11,7 +11,11 @@ Settings › Updates.
   else stays separate, including accounts that appear later and on the first sync.
 - An `exclude` or `only` entry that is not a full id stops syncing instead of matching nothing.
   `config` expands a unique prefix (like the 8 characters `doctor` shows) to the full id.
-- `cc-same orgs` lists every account/org on this computer with full ids.
+- `cc-same orgs` lists every account/org on this computer with full ids, its name and its most
+  recent session titles (`--json`, `--tsv`). Name an org with
+  `cc-same config --name <account>/<org>=<name>`; the org Claude Code's CLI is signed in to is
+  named from its login. `plan`, `sync` and `doctor` show the names.
+- `scripts/secure-setup.sh` speaks Chinese and asks for a name for each chosen org.
 - Accounts that appear later no longer join by default (`autoJoinNew` is off).
 - Account switching (`switch`, `add`, `remove`, `alias`, `disable`, `enable`, `move`) is left
   out of the command-line tool unless built with `--features account-switching`.
