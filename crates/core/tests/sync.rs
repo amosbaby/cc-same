@@ -775,3 +775,15 @@ fn a_short_id_in_exclude_stops_syncing() {
     assert!(cc_same_core::apply::run_sync(&e.ctx(), "test").is_err());
     assert!(!e.user_data.join("claude-code-sessions").join(B.0).join(B.1).join(format!("local_{x}.json")).exists());
 }
+
+#[test]
+fn the_last_sync_counts_every_round() {
+    let e = Env::new();
+    let x = uid();
+    e.record(A, &x, 100_000, json!({"title": "x"}));
+    e.code(B);
+    let (_, out) = cc_same_core::apply::run_sync(&e.ctx(), "test").unwrap();
+    assert!(out.applied_total() > 0);
+    let last = State::load(&e.paths()).last_sync.unwrap();
+    assert_eq!(last.applied, out.applied_total() as u64);
+}

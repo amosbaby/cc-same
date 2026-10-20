@@ -187,6 +187,9 @@ enum Cmd {
         /// Desktop notifications from the background agent
         #[arg(long)]
         notify: Option<OnOff>,
+        /// Language of the output: `system`, `zh-CN` or `en`
+        #[arg(long, value_name = "LANG")]
+        language: Option<String>,
     },
 }
 
@@ -221,6 +224,7 @@ fn run(cli: Cli) -> Result<()> {
     let detected = Paths::detect();
     let paths = Paths::new(cli.user_data.unwrap_or(detected.user_data), cli.state_dir.unwrap_or(detected.state_dir));
     let config = Config::load(&paths)?;
+    let _ = ZH.set(wants_chinese(&config.language));
     let mut ctx = Ctx::new(paths, config, FakeDesktop::from_env(), LogSink::Stderr);
     ctx.verbose = cli.verbose;
     let Some(cmd) = cli.cmd else {
@@ -297,7 +301,7 @@ fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "account-switching")]
         Cmd::Move { account, number } => move_account(&ctx, &account, number),
         Cmd::Orgs { json, tsv } => orgs(&ctx, json, tsv),
-        Cmd::Config { exclude, include, only, clear_only, name, unname, auto_join, notify } => {
+        Cmd::Config { exclude, include, only, clear_only, name, unname, auto_join, notify, language } => {
             let mut cfg = ctx.config();
             let before = cfg.clone();
             let known = known_pairs(&ctx);
@@ -335,6 +339,15 @@ fn run(cli: Cli) -> Result<()> {
             }
             if let Some(v) = notify {
                 cfg.notify = matches!(v, OnOff::On);
+            }
+            if let Some(lang) = language {
+                let lang = lang.trim().to_string();
+                anyhow::ensure!(
+                    lang == "system"
+                        || (lang.len() <= 16 && lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')),
+                    "--language takes `system` or a language code such as zh-CN"
+                );
+                cfg.language = lang;
             }
             if cfg != before {
                 cfg.save(&ctx.paths)?;
@@ -443,9 +456,109 @@ fn orgs(ctx: &Ctx, json: bool, tsv: bool) -> Result<()> {
     Ok(())
 }
 
+static ZH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Chinese output: `CC_SAME_LANG`, then the `language` setting, then the system locale.
+fn wants_chinese(setting: &str) -> bool {
+    let is_zh = |v: &str| v.trim().to_ascii_lowercase().starts_with("zh");
+    if let Some(v) = std::env::var("CC_SAME_LANG").ok().filter(|v| !v.trim().is_empty()) {
+        return is_zh(&v);
+    }
+    if setting != "system" && !setting.is_empty() {
+        return is_zh(setting);
+    }
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .is_some_and(|v| is_zh(&v))
+}
+
+fn zh() -> bool {
+    ZH.get().copied().unwrap_or(false)
+}
+
+/// `en` or `zh`, by the output language.
+fn tr<'a>(en: &'a str, zh_text: &'a str) -> &'a str {
+    if zh() {
+        zh_text
+    } else {
+        en
+    }
+}
+
+/// [`report::ago`] in the output language.
+fn ago(t: f64) -> String {
+    if !zh() {
+        return report::ago(t);
+    }
+    let secs = (fsx::now_secs() - t).max(0.0);
+    match secs {
+        s if s < 45.0 => "刚刚".into(),
+        s if s < 3600.0 => format!("{} 分钟前", ((s / 60.0).round() as u64).max(1)),
+        s if s < 86400.0 => format!("{} 小时前", ((s / 3600.0).round() as u64).max(1)),
+        s if s < 172800.0 => "昨天".into(),
+        s => format!("{} 天前", (s / 86400.0).round() as u64),
+    }
+}
+
+/// A plan entry's kind ([`report::kind_label`]) in the output language.
+fn kind_text(kind: &str) -> &str {
+    if !zh() {
+        return kind;
+    }
+    match kind {
+        "new sessions" => "个新会话",
+        "updated sessions" => "个会话更新",
+        "deleted sessions" => "个会话删除",
+        "deletion markers" => "条删除记录",
+        "stale deletion markers" => "条过期删除记录",
+        "merged task lists" => "个任务列表合并",
+        "archive hint" => "个归档索引",
+        other => other,
+    }
+}
+
+/// What the service manager says about the agent ([`service::status`]), in the output language.
+fn service_detail(detail: &str) -> &str {
+    if !zh() {
+        return detail;
+    }
+    match detail {
+        "running" => "运行中",
+        "loaded, not running" => "已加载，未运行",
+        "installed, not loaded" => "已安装，未加载",
+        "not installed" => "未安装",
+        "registered to start at login" => "已设为登录时启动",
+        "running (systemd user service)" => "运行中（systemd 用户服务）",
+        "installed (systemd user service)" => "已安装（systemd 用户服务）",
+        "starts at login (autostart)" => "登录时启动（autostart）",
+        "unsupported" => "此平台不支持",
+        other => other,
+    }
+}
+
+/// Why a sync ran, in the output language.
+fn reason_text(reason: &str) -> &str {
+    if !zh() {
+        return reason;
+    }
+    match reason {
+        "manual" => "手动",
+        "install" => "安装时",
+        "watch" => "后台",
+        other => other,
+    }
+}
+
 fn confirm(prompt: &str) -> bool {
     if !std::io::stdin().is_terminal() {
-        println!("No terminal to ask in. Review the plan above, then run again with --yes.");
+        println!(
+            "{}",
+            tr(
+                "No terminal to ask in. Review the plan above, then run again with --yes.",
+                "没有可以提问的终端。请先查看上面的计划，再加 --yes 重新运行。"
+            )
+        );
         return false;
     }
     print!("{prompt} [y/N] ");
@@ -472,23 +585,40 @@ fn with_names(ctx: &Ctx, mut labels: BTreeMap<String, String>) -> BTreeMap<Strin
 fn describe_plan(ov_plan: &report::PlanView, labels: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     let mut lines = Vec::new();
     if ov_plan.total == 0 {
-        lines.push("Nothing to do: every linked account already has the same sessions.".to_string());
+        lines.push(
+            tr(
+                "Nothing to do: every linked account already has the same sessions.",
+                "无需改动：所有关联的组织已经有相同的会话。",
+            )
+            .to_string(),
+        );
     }
     for (p, kinds) in &ov_plan.per_partition {
         let who = labels.get(&p.key()).or(labels.get(&p.acct)).cloned().unwrap_or_else(|| p.label());
-        let what: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
-        lines.push(format!("  {:<6} {:<32} {}", p.surface.as_str(), who, what.join(", ")));
+        if zh() {
+            let what: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {}", kind_text(k))).collect();
+            lines.push(format!("  {who}：{}", what.join("，")));
+        } else {
+            let what: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
+            lines.push(format!("  {:<6} {:<32} {}", p.surface.as_str(), who, what.join(", ")));
+        }
     }
     if !ov_plan.deferred.is_empty() {
-        lines.push("Waiting for Claude (it has these open; applied after you switch accounts or quit):".into());
+        lines.push(
+            tr(
+                "Waiting for Claude (it has these open; applied after you switch accounts or quit):",
+                "等待 Claude（这些组织正在 Claude 中打开，切换组织或退出 Claude 后再应用）：",
+            )
+            .into(),
+        );
         for (key, n) in &ov_plan.deferred {
             let acct = key.split('/').next().unwrap_or(key);
             let who = labels.get(key).or(labels.get(acct)).cloned().unwrap_or_else(|| short(acct).to_string());
-            lines.push(format!("  {who}: {n} change(s)"));
+            lines.push(if zh() { format!("  {who}：{n} 项改动") } else { format!("  {who}: {n} change(s)") });
         }
     }
     for n in &ov_plan.notes {
-        lines.push(format!("note: {n}"));
+        lines.push(format!("{}{n}", tr("note: ", "提示：")));
     }
     lines
 }
@@ -562,7 +692,7 @@ fn doctor(ctx: &Ctx) -> Result<()> {
         }
     }
     println!("\nNot synced by design: sidebar groups and order (a server setting of each account), pins, Cowork tasks, claude.ai chats, projects and memory, cloud sessions, connectors and Remote Control links.");
-    println!("\nIf you sync now:");
+    println!("\n{}", tr("If you sync now:", "如果现在同步："));
     for l in describe_plan(&ov.plan, &with_names(ctx, ov.labels.clone())) {
         println!("{l}");
     }
@@ -571,13 +701,17 @@ fn doctor(ctx: &Ctx) -> Result<()> {
 
 fn service_line(ov: &Overview) -> String {
     let beat = ov.heartbeat.as_ref().filter(|h| h.is_fresh());
-    match (ov.service.installed, beat) {
-        (true, Some(h)) => format!("on (agent v{}, last check {})", h.version, report::ago(h.heartbeat_at)),
-        (true, None) => format!("on ({})", ov.service.detail),
-        (false, _) if ov.service.legacy => {
+    match (ov.service.installed, beat, zh()) {
+        (true, Some(h), false) => format!("on (agent v{}, last check {})", h.version, ago(h.heartbeat_at)),
+        (true, Some(h), true) => format!("已开启（后台进程 v{}，上次检查：{}）", h.version, ago(h.heartbeat_at)),
+        (true, None, false) => format!("on ({})", ov.service.detail),
+        (true, None, true) => format!("已开启（{}）", service_detail(&ov.service.detail)),
+        (false, _, false) if ov.service.legacy => {
             "the original Python agent is still installed; `cc-same install` replaces it".into()
         }
-        (false, _) => "off (turn on with `cc-same install`)".into(),
+        (false, _, true) if ov.service.legacy => "旧版 Python 后台进程仍在运行；`cc-same install` 会替换它".into(),
+        (false, _, false) => "off (turn on with `cc-same install`)".into(),
+        (false, _, true) => "已关闭（用 `cc-same install` 开启）".into(),
     }
 }
 
@@ -616,7 +750,13 @@ fn warning_text(w: &Warning) -> String {
 fn show_plan(ctx: &Ctx, verbose: bool) -> Result<()> {
     let (plan, app, _) = plan::build_plan(ctx, None, None);
     if app.running {
-        println!("Claude is running; changes to the account it has open wait until you switch accounts or quit.");
+        println!(
+            "{}",
+            tr(
+                "Claude is running; changes to the account it has open wait until you switch accounts or quit.",
+                "Claude 正在运行：它当前打开的组织的改动，会等你切换组织或退出 Claude 后再应用。"
+            )
+        );
     }
     let labels = with_names(ctx, cc_same_core::scan::account_labels(ctx));
     for l in describe_plan(&report::summarize(&plan), &labels) {
@@ -637,23 +777,35 @@ fn sync(ctx: &Ctx, yes: bool) -> Result<()> {
     for l in describe_plan(&report::summarize(&plan), &labels) {
         println!("{l}");
     }
-    if !plan.is_empty() && !yes && !confirm("Apply these changes?") {
+    if !plan.is_empty() && !yes && !confirm(tr("Apply these changes?", "应用这些改动吗？")) {
         return Ok(());
     }
     // Run even without changes: it records which accounts are linked and what each task list
     // looked like, which later merges depend on.
     let (_, out) = apply::run_sync(ctx, "manual")?;
     if !plan.is_empty() {
-        println!(
-            "Done: {} change(s){}.",
-            out.applied_total(),
-            if out.errors.is_empty() { String::new() } else { format!(", {} error(s)", out.errors.len()) }
-        );
+        let errors = out.errors.len();
+        if zh() {
+            let failed = if errors == 0 { String::new() } else { format!("，{errors} 个错误") };
+            println!("完成：{} 项改动{failed}。", out.applied_total());
+        } else {
+            let failed = if errors == 0 { String::new() } else { format!(", {errors} error(s)") };
+            println!("Done: {} change(s){failed}.", out.applied_total());
+        }
     }
     if !out.seeded_while_loaded.is_empty() {
-        println!("Quit and reopen Claude to see the sessions copied into the account it has open.");
+        println!(
+            "{}",
+            tr(
+                "Quit and reopen Claude to see the sessions copied into the account it has open.",
+                "退出并重新打开 Claude，才能看到复制进它当前打开组织的会话。"
+            )
+        );
     }
     if !out.errors.is_empty() {
+        if zh() {
+            bail!("{} 项改动失败，详见上方", out.errors.len());
+        }
         bail!("{} change(s) failed; see above", out.errors.len());
     }
     Ok(())
@@ -662,11 +814,12 @@ fn sync(ctx: &Ctx, yes: bool) -> Result<()> {
 fn install(ctx: &Ctx, yes: bool) -> Result<()> {
     let (plan, _, _) = plan::build_plan(ctx, None, None);
     let labels = with_names(ctx, cc_same_core::scan::account_labels(ctx));
-    println!("First sync:");
+    println!("{}", tr("First sync:", "首次同步："));
     for l in describe_plan(&report::summarize(&plan), &labels) {
         println!("{l}");
     }
-    if !yes && !confirm("Sync now and keep syncing in the background?") {
+    if !yes && !confirm(tr("Sync now and keep syncing in the background?", "现在同步，并在后台持续同步吗？"))
+    {
         return Ok(());
     }
     if !ctx.paths.config_file().exists() {
@@ -682,10 +835,21 @@ fn install(ctx: &Ctx, yes: bool) -> Result<()> {
         (exe, if cfg!(windows) { "cc-same.exe" } else { "cc-same" })
     };
     let installed = service::install(ctx, &source, name)?;
-    println!("Background sync is on ({}).", installed.display());
-    println!("Log: {}", ctx.paths.log_file.display());
+    if zh() {
+        println!("后台同步已开启（{}）。", installed.display());
+        println!("日志：{}", ctx.paths.log_file.display());
+    } else {
+        println!("Background sync is on ({}).", installed.display());
+        println!("Log: {}", ctx.paths.log_file.display());
+    }
     if !out.seeded_while_loaded.is_empty() {
-        println!("Quit and reopen Claude once to see the sessions copied into the account it has open.");
+        println!(
+            "{}",
+            tr(
+                "Quit and reopen Claude once to see the sessions copied into the account it has open.",
+                "退出并重新打开 Claude 一次，才能看到复制进它当前打开组织的会话。"
+            )
+        );
     }
     Ok(())
 }
@@ -961,15 +1125,47 @@ fn move_account(ctx: &Ctx, query: &str, number: u32) -> Result<()> {
 
 fn status(ctx: &Ctx) -> Result<()> {
     let st = service::status(ctx);
-    println!("Background sync: {}{}", if st.installed { "on, " } else { "off, " }, st.detail);
-    if let Some(h) = Heartbeat::read(&ctx.paths) {
-        println!("Agent: v{} (pid {}), last check {}", h.version, h.pid, report::ago(h.heartbeat_at));
-    }
+    let names = with_names(ctx, scan::account_labels(ctx));
     let state = State::load(&ctx.paths);
+    let beat = Heartbeat::read(&ctx.paths);
+    let linked = |keys: &[String]| -> String {
+        let list: Vec<String> = keys
+            .iter()
+            .map(|k| names.get(k).cloned().unwrap_or_else(|| k.split('/').map(short).collect::<Vec<_>>().join("/")))
+            .collect();
+        list.join(if zh() { "，" } else { ", " })
+    };
+    if zh() {
+        println!("后台同步：{}，{}", if st.installed { "已开启" } else { "已关闭" }, service_detail(&st.detail));
+        if let Some(h) = &beat {
+            println!("后台进程：v{}（pid {}），上次检查：{}", h.version, h.pid, ago(h.heartbeat_at));
+        }
+        match &state.last_sync {
+            Some(ls) => println!(
+                "上次同步：{}（{}）：{} 项改动，{} 个错误，{} 项等待 Claude",
+                ago(ls.at),
+                reason_text(&ls.reason),
+                ls.applied,
+                ls.errors,
+                ls.deferred
+            ),
+            None => println!("还没有同步过。"),
+        }
+        println!("基线快照：{}", state.baseline.as_deref().unwrap_or("无"));
+        for keys in state.known.values() {
+            println!("已关联的组织：{}", linked(keys));
+        }
+        println!("日志：{}", ctx.paths.log_file.display());
+        return Ok(());
+    }
+    println!("Background sync: {}{}", if st.installed { "on, " } else { "off, " }, st.detail);
+    if let Some(h) = &beat {
+        println!("Agent: v{} (pid {}), last check {}", h.version, h.pid, ago(h.heartbeat_at));
+    }
     match &state.last_sync {
         Some(ls) => println!(
             "Last sync: {} ({}): {} change(s), {} error(s), {} waiting for Claude",
-            report::ago(ls.at),
+            ago(ls.at),
             ls.reason,
             ls.applied,
             ls.errors,
@@ -979,8 +1175,7 @@ fn status(ctx: &Ctx) -> Result<()> {
     }
     println!("Baseline snapshot: {}", state.baseline.as_deref().unwrap_or("none"));
     for (surface, keys) in &state.known {
-        let list: Vec<String> = keys.iter().map(|k| k.split('/').map(short).collect::<Vec<_>>().join("/")).collect();
-        println!("Linked {surface}: {}", list.join(", "));
+        println!("Linked {surface}: {}", linked(keys));
     }
     println!("Log: {}", ctx.paths.log_file.display());
     Ok(())

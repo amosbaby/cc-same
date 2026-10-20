@@ -122,7 +122,7 @@ if [ "$YES" = 0 ]; then
 fi
 
 say "只同步选中的组织，其他账号和组织一律不碰"
-ARGS=(config --clear-only --auto-join off --notify on)
+ARGS=(config --clear-only --auto-join off --notify on --language zh-CN)
 for o in "${PICKED[@]}"; do ARGS+=(--only "$o"); done
 if [ "${#NAMEARGS[@]}" -gt 0 ]; then ARGS+=("${NAMEARGS[@]}"); fi
 "$BIN" "${ARGS[@]}" >/dev/null

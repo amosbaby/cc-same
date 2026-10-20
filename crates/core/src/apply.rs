@@ -288,6 +288,15 @@ pub fn run_sync(ctx: &Ctx, reason: &str) -> Result<(Plan, Outcome)> {
             break;
         }
     }
+    // Each round records itself, and the last one usually has nothing left to do: record the run.
+    if total.applied_total() > 0 || !total.errors.is_empty() {
+        let mut state = State::load(&ctx.paths);
+        if let Some(ls) = state.last_sync.as_mut() {
+            ls.applied = total.applied_total() as u64;
+            ls.errors = total.errors.len() as u64;
+            state.save(&ctx.paths)?;
+        }
+    }
     if !total.seeded_while_loaded.is_empty() {
         let app = desktop::detect(ctx);
         let mut state = State::load(&ctx.paths);
