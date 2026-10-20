@@ -11,7 +11,7 @@
 > **一键安装**（macOS，需要 Rust）：
 >
 > ```bash
-> git clone -b security-hardening https://github.com/amosbaby/cc-same cc-same && cd cc-same && ./scripts/secure-setup.sh
+> git clone https://github.com/amosbaby/cc-same cc-same && cd cc-same && ./scripts/secure-setup.sh
 > ```
 >
 > 脚本会列出本机的账号/组织，让你选择要同步的那几个，然后等你退出 Claude，展示同步计划，完成首次同步，并启动后台同步。
