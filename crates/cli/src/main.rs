@@ -213,6 +213,11 @@ impl From<StrategyArg> for Strategy {
 }
 
 fn main() {
+    // Output piped into `head` and the like ends quietly instead of panicking on a closed pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
         eprintln!("cc-same: {e:#}");
@@ -529,9 +534,9 @@ fn service_detail(detail: &str) -> &str {
         "installed, not loaded" => "已安装，未加载",
         "not installed" => "未安装",
         "registered to start at login" => "已设为登录时启动",
-        "running (systemd user service)" => "运行中（systemd 用户服务）",
-        "installed (systemd user service)" => "已安装（systemd 用户服务）",
-        "starts at login (autostart)" => "登录时启动（autostart）",
+        "running (systemd user service)" => "运行中 · systemd 用户服务",
+        "installed (systemd user service)" => "已安装 · systemd 用户服务",
+        "starts at login (autostart)" => "登录时自动启动",
         "unsupported" => "此平台不支持",
         other => other,
     }
@@ -626,33 +631,66 @@ fn describe_plan(ov_plan: &report::PlanView, labels: &std::collections::BTreeMap
 fn doctor(ctx: &Ctx) -> Result<()> {
     let ov = report::overview(ctx);
     println!("cc-same {}", cc_same_core::VERSION);
-    let desktop = match (&ov.desktop_version, ov.app.running) {
-        (Some(v), true) => format!("Claude {v}, running"),
-        (Some(v), false) => format!("Claude {v}, not running"),
-        (None, true) => "Claude is running".to_string(),
-        (None, false) => "Claude is not running".to_string(),
-    };
-    let open = ov.app.open_account.as_deref().map(|a| format!("; open account: {}", email_or_id(&ov, a)));
-    println!("{desktop}{}", open.unwrap_or_default());
-    println!("Background sync: {}", service_line(&ov));
     let names = with_names(ctx, ov.labels.clone());
+    let desktop = match (&ov.desktop_version, ov.app.running, zh()) {
+        (Some(v), true, false) => format!("Claude {v}, running"),
+        (Some(v), false, false) => format!("Claude {v}, not running"),
+        (None, true, false) => "Claude is running".to_string(),
+        (None, false, false) => "Claude is not running".to_string(),
+        (Some(v), true, true) => format!("Claude {v}，正在运行"),
+        (Some(v), false, true) => format!("Claude {v}，未运行"),
+        (None, true, true) => "Claude 正在运行".to_string(),
+        (None, false, true) => "Claude 未运行".to_string(),
+    };
+    let open = ov.app.open_account.as_deref().map(|a| {
+        if zh() {
+            let org = ov.app.open_org.as_deref().map(|o| format!("{a}/{o}"));
+            let who = org.and_then(|k| names.get(&k).cloned()).unwrap_or_else(|| email_or_id(&ov, a));
+            format!("；当前打开：{who}")
+        } else {
+            format!("; open account: {}", email_or_id(&ov, a))
+        }
+    });
+    println!("{desktop}{}", open.unwrap_or_default());
+    println!("{}{}", tr("Background sync: ", "后台同步："), service_line(&ov));
     for sv in &ov.surfaces {
         println!();
-        println!("{} sessions ({})", sv.surface.title(), sv.surface.dir_name());
+        if zh() {
+            println!("会话列表（{}）", sv.surface.dir_name());
+        } else {
+            println!("{} sessions ({})", sv.surface.title(), sv.surface.dir_name());
+        }
         for pv in &sv.partitions {
             let mut flags = Vec::new();
             if ov.app.showing(&pv.part) {
-                flags.push("OPEN IN CLAUDE");
+                flags.push(tr("OPEN IN CLAUDE", "← Claude 当前打开"));
             }
             if pv.excluded {
-                flags.push("excluded");
+                flags.push(tr("excluded", "不同步"));
             }
             if pv.part.is_link {
-                flags.push("SYMLINK");
+                flags.push(tr("SYMLINK", "符号链接"));
             }
             let who = names.get(&pv.part.key()).or(pv.email.as_ref()).cloned().unwrap_or_default();
             if let Some(err) = &pv.error {
                 println!("  {}  {:<30} {}  {err}", pv.part.label(), who, flags.join(" "));
+                continue;
+            }
+            if zh() {
+                let mut facts = vec![format!("{} 个会话", pv.sessions)];
+                if pv.archived > 0 {
+                    facts.push(format!("{} 个已归档", pv.archived));
+                }
+                if pv.missing > 0 && !pv.excluded {
+                    facts.push(format!("缺 {} 个", pv.missing));
+                }
+                if pv.unreadable > 0 {
+                    facts.push(format!("{} 个无法读取", pv.unreadable));
+                }
+                println!("  {}  {}  {}  {}", pv.part.label(), who, facts.join(" · "), flags.join(" "));
+                if ctx.verbose && !pv.unmanaged.is_empty() {
+                    println!("      未处理的文件：{}", pv.unmanaged.join("，"));
+                }
                 continue;
             }
             let mut facts = vec![format!("{} sessions", pv.sessions)];
@@ -671,27 +709,56 @@ fn doctor(ctx: &Ctx) -> Result<()> {
             }
         }
     }
-    let retention = match ov.retention.desktop_days {
-        Some(d) => format!("deleted after {d} days"),
-        None => "kept at any age".into(),
-    };
     println!();
-    println!("Transcripts of Desktop sessions: {retention}");
-    if let Some(ls) = &ov.last_sync {
-        println!("Last sync: {} ({}), {} change(s), {} error(s)", report::ago(ls.at), ls.reason, ls.applied, ls.errors);
-    }
-    if let Some(hint) = ov.restart_hint() {
-        println!("\nQuit and reopen Claude to see {} session(s) copied into the account it has open.", hint.sessions);
+    if zh() {
+        let retention = match ov.retention.desktop_days {
+            Some(d) => format!("{d} 天后删除"),
+            None => "永久保留".into(),
+        };
+        println!("Desktop 会话的转录：{retention}");
+        if let Some(ls) = &ov.last_sync {
+            println!(
+                "上次同步：{}（{}），{} 项改动，{} 个错误",
+                ago(ls.at),
+                reason_text(&ls.reason),
+                ls.applied,
+                ls.errors
+            );
+        }
+        if let Some(hint) = ov.restart_hint() {
+            println!("\n退出并重新打开 Claude，才能看到复制进它当前打开组织的 {} 个会话。", hint.sessions);
+        }
+    } else {
+        let retention = match ov.retention.desktop_days {
+            Some(d) => format!("deleted after {d} days"),
+            None => "kept at any age".into(),
+        };
+        println!("Transcripts of Desktop sessions: {retention}");
+        if let Some(ls) = &ov.last_sync {
+            println!("Last sync: {} ({}), {} change(s), {} error(s)", ago(ls.at), ls.reason, ls.applied, ls.errors);
+        }
+        if let Some(hint) = ov.restart_hint() {
+            println!(
+                "\nQuit and reopen Claude to see {} session(s) copied into the account it has open.",
+                hint.sessions
+            );
+        }
     }
     if !ov.warnings.is_empty() {
         println!();
         for w in &ov.warnings {
             // Several organizations is the normal case, so it reads as a tip, not a problem.
             let mark = if matches!(w, Warning::SpansOrgs { .. }) { "·" } else { "!" };
-            println!("{mark} {}", warning_text(w));
+            println!("{mark} {}", if zh() { warning_text_zh(w) } else { warning_text(w) });
         }
     }
-    println!("\nNot synced by design: sidebar groups and order (a server setting of each account), pins, Cowork tasks, claude.ai chats, projects and memory, cloud sessions, connectors and Remote Control links.");
+    println!(
+        "\n{}",
+        tr(
+            "Not synced by design: sidebar groups and order (a server setting of each account), pins, Cowork tasks, claude.ai chats, projects and memory, cloud sessions, connectors and Remote Control links.",
+            "按设计不同步：侧边栏分组和排序（各账号的服务器端设置）、置顶、Cowork 任务、claude.ai 聊天、项目和记忆、云端会话、连接器和 Remote Control 链接。"
+        )
+    );
     println!("\n{}", tr("If you sync now:", "如果现在同步："));
     for l in describe_plan(&ov.plan, &with_names(ctx, ov.labels.clone())) {
         println!("{l}");
@@ -712,6 +779,41 @@ fn service_line(ov: &Overview) -> String {
         (false, _, true) if ov.service.legacy => "旧版 Python 后台进程仍在运行；`cc-same install` 会替换它".into(),
         (false, _, false) => "off (turn on with `cc-same install`)".into(),
         (false, _, true) => "已关闭（用 `cc-same install` 开启）".into(),
+    }
+}
+
+/// [`warning_text`] in Chinese.
+fn warning_text_zh(w: &Warning) -> String {
+    match w {
+        Warning::SymlinkedFolders { count, .. } => format!(
+            "有 {count} 个会话文件夹是符号链接，Claude 会悄悄停止往里面保存会话。请退出 Claude 后运行：cc-same fix-symlinks"
+        ),
+        Warning::LeftoverFolders { dirs, .. } => {
+            format!("发现其他工具留下的备份文件夹：{}（可以手动归档）", dirs.join("，"))
+        }
+        Warning::SpansOrgs { orgs, .. } => format!(
+            "同步横跨 {orgs} 个组织，同步的会话会出现在所有这些组织里。要只同步指定的组织：cc-same config --only <账号>/<组织>"
+        ),
+        Warning::ShortRetention { days, limited_by, path } => {
+            let why = match limited_by {
+                Limit::DesktopSetting => format!("{} 里的 desktopSessionCleanupPeriodDays", path.display()),
+                Limit::Organization => "你所在组织的托管设置".into(),
+                Limit::OlderClaudeCode => "Claude Code 版本低于 2.1.248；升级 Claude 后会永久保留".into(),
+            };
+            let fix = match limited_by {
+                Limit::Organization => "",
+                _ => "要保留它们：cc-same retention --keep",
+            };
+            format!("Claude Code 会在 {days} 天后删除 Desktop 会话的转录（原因：{why}），没有转录的会话打开是空的。{fix}")
+        }
+        Warning::MissingTranscripts { missing, total } => {
+            format!("{total} 个会话中有 {missing} 个的转录已不在磁盘上，打开会是空的或打不开")
+        }
+        Warning::DesktopDataMissing { path } => format!("没有找到 Claude Desktop 的数据文件夹：{}", path.display()),
+        Warning::InvalidConfigEntries { entries } => format!(
+            "同步已停止：配置里这些 ID 不是完整 ID，匹配不到任何文件夹：{}。请删掉它们（cc-same config --include <id> 或 --clear-only），再用 `cc-same orgs` 里的完整 ID 重新添加",
+            entries.join("，")
+        ),
     }
 }
 

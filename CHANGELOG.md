@@ -16,7 +16,7 @@ Settings › Updates.
   `cc-same config --name <account>/<org>=<name>`; the org Claude Code's CLI is signed in to is
   named from its login. `plan`, `sync` and `doctor` show the names.
 - `scripts/secure-setup.sh` speaks Chinese and asks for a name for each chosen org.
-- `plan`, `sync`, `install` and `status` print in Chinese when `language` is `zh-*`
+- `plan`, `sync`, `install`, `status` and `doctor` print in Chinese when `language` is `zh-*`
   (`cc-same config --language zh-CN`), `CC_SAME_LANG=zh`, or the system locale is Chinese; the
   setup script sets it.
 
@@ -24,6 +24,7 @@ Settings › Updates.
 
 - `status` reported 0 changes after a sync that made some: the last, empty round of a run
   overwrote the count.
+- Output piped into `head` and the like no longer ends in a panic.
 - Accounts that appear later no longer join by default (`autoJoinNew` is off).
 - Account switching (`switch`, `add`, `remove`, `alias`, `disable`, `enable`, `move`) is left
   out of the command-line tool unless built with `--features account-switching`.

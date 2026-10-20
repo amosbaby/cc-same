@@ -25,6 +25,9 @@ clap.workspace = true
 serde_json.workspace = true
 cc-same-core.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [features]
 # `switch`, `add`, `remove`, `alias`, `disable`, `enable` and `move` sign Claude in and out by
 # moving its saved sign-ins around. Left out unless asked for: syncing never needs them.

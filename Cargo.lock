@@ -102,6 +102,7 @@ dependencies = [
  "anyhow",
  "cc-same-core",
  "clap",
+ "libc",
  "serde_json",
 ]
 
